@@ -103,6 +103,7 @@ typedef struct UDP_ASSOCIATION {
 typedef struct {
     SOCKET client_socket;
     int family;               // AF_INET or AF_INET6 (of the local app connection)
+    UINT8 peer_addr[16];      // accepted socket's peer address (= original destination)
     UINT16 orig_dest_port;
     UINT32 proxy_id;
 } CONNECTION_CONFIG;

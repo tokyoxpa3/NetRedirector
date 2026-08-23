@@ -16,12 +16,19 @@ UINT32 g_next_proxy_id = 0;
 // === Connection Tracking ===
 // (protected by lock_connections)
 //
-// Keying: TCP entries are keyed by src_port alone (one connection per socket).
-// UDP entries are keyed by (src_port + family + original destination): a single
-// UDP socket commonly sends to several destinations (DNS resolver rotation,
-// QUIC, game server lists), and each destination must keep its own tracked
-// port/proxy mapping or packets for the second destination would be relayed to
-// the first one's server.
+// Keying: TCP entries are keyed by (src_port + family + original destination
+// address). A src_port-only key was removed: when an app dies without FIN/RST
+// the entry lingers until the timeout sweep, and Windows aggressively recycles
+// ephemeral ports - the next connection from the same port to a DIFFERENT
+// destination (e.g. a LAN host) would then be hijacked into the old flow's
+// proxy path before rule/LAN evaluation ever ran. With the destination in the
+// key, such packets miss the stale entry and get classified as a new
+// connection; both entries coexist harmlessly until they time out.
+// UDP entries are keyed by (src_port + family + original destination): a
+// single UDP socket commonly sends to several destinations (DNS resolver
+// rotation, QUIC, game server lists), and each destination must keep its own
+// tracked port/proxy mapping or packets for the second destination would be
+// relayed to the first one's server.
 
 void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action, BOOL is_udp)
 {
@@ -31,13 +38,18 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
     while (existing != NULL) {
         BOOL same_key = FALSE;
         if (existing->src_port == src_port) {
+            int n = (family == AF_INET) ? 4 : 16;
             if (is_udp) {
-                int n = (family == AF_INET) ? 4 : 16;
                 same_key = existing->is_udp && existing->family == family &&
                            dest_addr != NULL &&
                            memcmp(existing->orig_dest_addr, dest_addr, n) == 0;
             } else {
-                same_key = !existing->is_udp;
+                // [Fixed] TCP key now includes family + original destination:
+                // same-port entries for different destinations coexist instead
+                // of silently overwriting each other.
+                same_key = !existing->is_udp && existing->family == family &&
+                           dest_addr != NULL &&
+                           memcmp(existing->orig_dest_addr, dest_addr, n) == 0;
             }
         }
         if (same_key) {
@@ -77,12 +89,17 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
     LeaveCriticalSection(&lock_connections);
 }
 
-// [Modified] TCP lookup: key = (src_port + family + local source address).
-// Callers pass the packet's app-side endpoint (outbound: src addr/port;
-// returning: dst addr/port). src_addr length follows family (4/16 bytes).
-BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action)
+// [Modified] TCP lookup: key = (src_port + family + original destination
+// address). Callers pass the packet's destination address for outbound packets,
+// or the app-endpoint address for relay-returning packets (which equals the
+// stored original destination - see the NAT swap in process_packet).
+// dest_key length follows family (4/16 bytes); NULL key is always a miss.
+BOOL get_connection(UINT16 src_port, int family, const UINT8 *dest_key, int *out_family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action)
 {
     BOOL found = FALSE;
+    if (dest_key == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
     EnterCriticalSection(&lock_connections);
     CONNECTION_INFO *conn = connection_list;
     CONNECTION_INFO *prev = NULL;
@@ -91,9 +108,11 @@ BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest
     {
         // TCP semantics: same-port UDP entries (different sockets can share a
         // port number) never satisfy a TCP lookup.
-        if (conn->src_port == src_port && !conn->is_udp)
+        if (conn->src_port == src_port && !conn->is_udp &&
+            conn->family == family &&
+            memcmp(conn->orig_dest_addr, dest_key, n) == 0)
         {
-            if (family) *family = conn->family;
+            if (out_family) *out_family = conn->family;
             if (dest_addr) memcpy(dest_addr, conn->orig_dest_addr, 16);
             if (dest_port) *dest_port = conn->orig_dest_port;
             if (proxy_id) *proxy_id = conn->proxy_id;
@@ -118,14 +137,20 @@ BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest
     return found;
 }
 
-BOOL is_connection_tracked(UINT16 src_port)
+BOOL is_connection_tracked(UINT16 src_port, int family, const UINT8 *dest_key)
 {
     BOOL tracked = FALSE;
+    if (dest_key == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
     EnterCriticalSection(&lock_connections);
     CONNECTION_INFO *conn = connection_list;
     CONNECTION_INFO *prev = NULL;
     while (conn != NULL) {
-        if (conn->src_port == src_port && !conn->is_udp) {
+        if (conn->src_port == src_port && !conn->is_udp &&
+            conn->family == family &&
+            memcmp(conn->orig_dest_addr, dest_key, n) == 0)
+        {
             tracked = TRUE;
             if (prev != NULL) {
                 prev->next = conn->next;
@@ -227,15 +252,22 @@ BOOL get_udp_dest_port_for_app(UINT16 src_port, UINT16 *dest_port)
     return found;
 }
 
-void remove_connection(UINT16 src_port)
+void remove_connection(UINT16 src_port, int family, const UINT8 *dest_key)
 {
+    if (dest_key == NULL) return;
+    int n = (family == AF_INET) ? 4 : 16;
+
     EnterCriticalSection(&lock_connections);
     CONNECTION_INFO **conn_ptr = &connection_list;
     while (*conn_ptr != NULL)
     {
         // TCP-only: callers are the TCP FIN/RST paths; never evict a UDP
-        // entry that happens to share the port number.
-        if ((*conn_ptr)->src_port == src_port && !(*conn_ptr)->is_udp)
+        // entry that happens to share the port number. Removal follows the
+        // full key so a sibling entry (same port, other destination) and any
+        // same-port UDP entry survive.
+        if ((*conn_ptr)->src_port == src_port && !(*conn_ptr)->is_udp &&
+            (*conn_ptr)->family == family &&
+            memcmp((*conn_ptr)->orig_dest_addr, dest_key, n) == 0)
         {
             CONNECTION_INFO *to_free = *conn_ptr;
             *conn_ptr = to_free->next;

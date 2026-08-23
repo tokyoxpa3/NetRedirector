@@ -63,8 +63,8 @@ static DWORD WINAPI conn_ops(LPVOID arg)
         UINT8 src[16] = {127, 0, 0, 1};
         UINT8 dst[16] = {8, 8, 8, 8};
         add_connection(port, AF_INET, src, dst, 443, 1, RULE_ACTION_PROXY, FALSE);
-        if (!is_connection_tracked(port)) { InterlockedIncrement(&g_failures); }
-        remove_connection(port);
+        if (!is_connection_tracked(port, AF_INET, dst)) { InterlockedIncrement(&g_failures); }
+        remove_connection(port, AF_INET, dst);
         InterlockedIncrement(&g_rounds);
     }
     return 0;

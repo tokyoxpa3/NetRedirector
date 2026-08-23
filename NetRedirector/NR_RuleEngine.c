@@ -158,8 +158,11 @@ RuleAction handle_new_connection_logic(int family, const UINT8 *src_addr, const 
     UINT8 dest_addr_cache[16];
     UINT16 dest_port_cache;
 
-    // Check cache
-    if (get_connection(src_port, NULL, dest_addr_cache, &dest_port_cache, &proxy_id_cache, &action)) {
+    // Check cache (TCP entries only, full key: port + family + destination).
+    // A UDP flow can at worst hit a same-port TCP entry to the identical
+    // destination - vanishingly rare - and otherwise falls through to fresh
+    // classification below.
+    if (get_connection(src_port, family, dest_addr, NULL, dest_addr_cache, &dest_port_cache, &proxy_id_cache, &action)) {
         *selected_proxy_id = proxy_id_cache;
         return action;
     }

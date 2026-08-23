@@ -128,29 +128,36 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
 
         // TCP Logic
         if (tcp_header != NULL) {
+            int n = (family == AF_INET) ? 4 : 16;
             if (addr->Outbound) {
                 // 1. Returning from Local Proxy
                 if (tcp_header->SrcPort == htons(g_local_relay_port)) {
+                    // Before any rewrite: dst_addr is the app-endpoint address,
+                    // which equals the entry's original-destination component
+                    // (the NAT swap made the relay's peer look like the original
+                    // destination). It is both the lookup key and, after FIN/RST,
+                    // the removal key.
+                    UINT8 app_endpoint[16];
+                    memcpy(app_endpoint, dst_addr, n);
                     UINT16 dst_port = ntohs(tcp_header->DstPort);
                     UINT8 orig_dest_addr[16];
                     UINT16 orig_dest_port;
-                    if (get_connection(dst_port, NULL, orig_dest_addr, &orig_dest_port, NULL, NULL)) {
+                    if (get_connection(dst_port, family, app_endpoint, NULL, orig_dest_addr, &orig_dest_port, NULL, NULL)) {
                         tcp_header->SrcPort = htons(orig_dest_port);
                         // DstAddr := old SrcAddr (local app IP), SrcAddr := original destination
-                        int n = (family == AF_INET) ? 4 : 16;
                         memcpy(dst_addr, src_addr, n);
                         memcpy(src_addr, orig_dest_addr, n);
+                        if (tcp_header->Fin || tcp_header->Rst) remove_connection(dst_port, family, app_endpoint);
                     }
                     addr->Outbound = FALSE;
-                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(dst_port);
                 }
                 // 2. Tracked Outbound
-                else if (is_connection_tracked(ntohs(tcp_header->SrcPort))) {
+                else if (is_connection_tracked(ntohs(tcp_header->SrcPort), family, dst_addr)) {
                     UINT16 src_port = ntohs(tcp_header->SrcPort);
                     UINT32 proxy_id = 0;
-                    get_connection(src_port, NULL, NULL, NULL, &proxy_id, NULL);
+                    get_connection(src_port, family, dst_addr, NULL, NULL, NULL, &proxy_id, NULL);
 
-                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port);
+                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port, family, dst_addr);
 
                     if (proxy_id > 0) {
                         tcp_header->DstPort = htons(g_local_relay_port);
@@ -490,6 +497,13 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
 
         // Prune expired logged-connection dedup entries (10 minute TTL)
         prune_logged_connections(current_time, 600000);
+
+        // [Added] Refresh the LAN/on-link cache each sweep: VPN/virtual
+        // adapters may come up or renew their IP while running, and the cache
+        // used to be built once at Start only. GetAdaptersAddresses at this
+        // cadence is cheap. Readers tolerate the swap (worst case one sweep
+        // uses the previous prefix set).
+        refresh_local_addresses();
     }
     return 0;
 }
@@ -570,6 +584,8 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     conn_config->family = AF_INET;
                     conn_config->orig_dest_port = ntohs(client_addr.sin_port);
                     conn_config->proxy_id = 0;
+                    memset(conn_config->peer_addr, 0, sizeof(conn_config->peer_addr));
+                    memcpy(conn_config->peer_addr, &client_addr.sin_addr, 4);
 
                     HANDLE t = CreateThread(NULL, 0, connection_handler, (LPVOID)conn_config, 0, NULL);
                     if (t) CloseHandle(t);
@@ -591,6 +607,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                     conn_config->family = AF_INET6;
                     conn_config->orig_dest_port = ntohs(client_addr6.sin6_port);
                     conn_config->proxy_id = 0;
+                    memcpy(conn_config->peer_addr, client_addr6.sin6_addr.s6_addr, 16);
 
                     HANDLE t = CreateThread(NULL, 0, connection_handler, (LPVOID)conn_config, 0, NULL);
                     if (t) CloseHandle(t);
@@ -611,6 +628,9 @@ DWORD WINAPI connection_handler(LPVOID arg)
     SOCKET client_sock = config->client_socket;
 
     // Lookup original destination
+    // Key: (app source port + family + original destination address). The
+    // accepted socket's peer endpoint IS the original destination - the NAT
+    // swap rewrote the outbound SYN's source to it before injection.
     UINT8 dest_addr[16];
     int family;
     UINT16 dest_port;
@@ -619,7 +639,8 @@ DWORD WINAPI connection_handler(LPVOID arg)
         int retries = 5;
         BOOL found = FALSE;
         while (retries-- > 0) {
-            if (get_connection(config->orig_dest_port, &family, dest_addr, &dest_port, &proxy_id, NULL)) {
+            if (get_connection(config->orig_dest_port, config->family, config->peer_addr,
+                &family, dest_addr, &dest_port, &proxy_id, NULL)) {
                 found = TRUE; break;
             }
             Sleep(10);

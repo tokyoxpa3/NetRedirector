@@ -443,7 +443,7 @@ static DWORD WINAPI dns_refresh_worker(LPVOID arg)
 
 NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 {
-    char filter[512];
+    char filter[1024];
     if (running) return FALSE;
 
     // [Fixed] Pre-flight: verify the local relay port is bindable BEFORE
@@ -546,13 +546,38 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     Sleep(500); // Give servers time to bind
 
     // Open WinDivert
+    //
+    // [Fixed] Loopback bypass at the filter layer: 127.0.0.0/8 and ::1 traffic
+    // used to be captured and then re-injected unchanged ("captured
+    // passthrough") after the upper-layer DIRECT checks. Every localhost
+    // packet thus paid a user-mode round trip (queue -> worker -> checksum ->
+    // WinDivertSend) and could be delayed or dropped under load - visible as
+    // instability for local services (e.g. MySQL on 127.0.0.1) in busy
+    // multi-service/Docker environments. Loopback destinations are always
+    // DIRECT by policy and never proxied, so excluding them in the filter is
+    // semantically identical and removes the entire overhead.
+    //
+    // The exclusion is written in positive/De Morgan form because the
+    // WinDivert filter language has no unary NOT: "keep" = inbound, OR
+    // destination-not-loopback, evaluated per family. Verified against the
+    // real driver: parses OK and captures zero loopback packets.
     snprintf(filter, sizeof(filter),
-        "(ip or ipv6) and ("
+        "(ip and ("
         "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
-        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d) "
-        "and udp.DstPort != 67 and udp.SrcPort != 67 and udp.DstPort != 68 and udp.SrcPort != 68)"
-        ")",
-        g_local_relay_port, g_local_relay_port, 
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d)"
+        " and udp.DstPort != 67 and udp.SrcPort != 67"
+        " and udp.DstPort != 68 and udp.SrcPort != 68))"
+        " and (inbound or ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255))"
+        " or "
+        "(ipv6 and ("
+        "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d)"
+        " and udp.DstPort != 67 and udp.SrcPort != 67"
+        " and udp.DstPort != 68 and udp.SrcPort != 68))"
+        " and (inbound or ipv6.DstAddr != ::1))",
+        g_local_relay_port, g_local_relay_port,
+        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT,
+        g_local_relay_port, g_local_relay_port,
         LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
 
     windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 123, 0);

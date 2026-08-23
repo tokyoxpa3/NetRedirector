@@ -8,46 +8,91 @@ int main(void)
 {
     init_locks();
 
-    printf("== add/get/is_tracked/remove connection (TCP) ==\n");
+    printf("== add/get/is_tracked/remove connection (TCP, full key) ==\n");
     {
         UINT8 src[16] = {192, 168, 1, 10};
         UINT8 dst[16] = {8, 8, 8, 8};
         UINT16 port = 43210;
 
-        CHECK(is_connection_tracked(port) == FALSE, "not tracked initially");
+        CHECK(is_connection_tracked(port, AF_INET, dst) == FALSE, "not tracked initially");
         add_connection(port, AF_INET, src, dst, 443, 7, RULE_ACTION_PROXY, FALSE);
-        CHECK(is_connection_tracked(port) == TRUE, "tracked after add");
+        CHECK(is_connection_tracked(port, AF_INET, dst) == TRUE, "tracked after add");
 
         int family = 0;
         UINT8 got_dst[16] = {0};
         UINT16 got_dport = 0;
         UINT32 got_pid = 0;
         RuleAction got_action = RULE_ACTION_DIRECT;
-        CHECK(get_connection(port, &family, got_dst, &got_dport, &got_pid, &got_action) == TRUE, "get_connection found");
+        CHECK(get_connection(port, AF_INET, dst, &family, got_dst, &got_dport, &got_pid, &got_action) == TRUE, "get_connection found");
         CHECK(family == AF_INET, "family preserved");
         CHECK(memcmp(got_dst, dst, 4) == 0, "dest addr preserved");
         CHECK(got_dport == 443, "dest port preserved");
         CHECK(got_pid == 7, "proxy id preserved");
         CHECK(got_action == RULE_ACTION_PROXY, "action preserved");
 
-        remove_connection(port);
-        CHECK(is_connection_tracked(port) == FALSE, "untracked after remove");
-        CHECK(get_connection(port, NULL, NULL, NULL, NULL, NULL) == FALSE, "get after remove -> FALSE");
+        // 完整 key: 同埠但不同目的地 / 不同 family 必須 miss
+        UINT8 other_dst[16] = {1, 1, 1, 1};
+        CHECK(is_connection_tracked(port, AF_INET, other_dst) == FALSE, "same port, other dest -> miss");
+        CHECK(is_connection_tracked(port, AF_INET6, dst) == FALSE, "family mismatch -> miss");
+        CHECK(is_connection_tracked(port, AF_INET, NULL) == FALSE, "NULL key -> miss");
+
+        remove_connection(port, AF_INET, dst);
+        CHECK(is_connection_tracked(port, AF_INET, dst) == FALSE, "untracked after keyed remove");
+        CHECK(get_connection(port, AF_INET, dst, NULL, NULL, NULL, NULL, NULL) == FALSE, "get after remove -> FALSE");
     }
 
-    printf("== add_connection 更新既有項目 ==\n");
+    printf("== 同埠不同目的地並存 (TCP, 不再互相覆蓋) ==\n");
     {
         UINT8 src[16] = {0};
-        UINT8 dst[16] = {1, 1, 1, 1};
-        add_connection(1000, AF_INET, src, dst, 53, 3, RULE_ACTION_DIRECT, FALSE);
-        UINT8 dst2[16] = {2, 2, 2, 2};
-        add_connection(1000, AF_INET, src, dst2, 443, 9, RULE_ACTION_PROXY, FALSE);  // 同 port 更新
+        UINT8 d1[16] = {1, 1, 1, 1};
+        UINT8 d2[16] = {2, 2, 2, 2};
+        UINT16 port = 1000;
+
+        add_connection(port, AF_INET, src, d1, 53, 3, RULE_ACTION_DIRECT, FALSE);
+        add_connection(port, AF_INET, src, d2, 443, 9, RULE_ACTION_PROXY, FALSE);
+
+        UINT16 dp = 0;
         UINT32 pid = 0;
-        UINT16 dport = 0;
-        get_connection(1000, NULL, NULL, &dport, &pid, NULL);
-        CHECK(dport == 443, "updated dest port");
-        CHECK(pid == 9, "updated proxy id");
-        remove_connection(1000);
+        RuleAction act = RULE_ACTION_BLOCK;
+        CHECK(get_connection(port, AF_INET, d1, NULL, NULL, &dp, &pid, &act) == TRUE, "d1 entry found");
+        CHECK(dp == 53 && pid == 3 && act == RULE_ACTION_DIRECT, "d1 keeps its own fields");
+        CHECK(get_connection(port, AF_INET, d2, NULL, NULL, &dp, &pid, &act) == TRUE, "d2 entry found");
+        CHECK(dp == 443 && pid == 9 && act == RULE_ACTION_PROXY, "d2 keeps its own fields");
+
+        // keyed remove 只移除指定目的地, 兄弟條目存活
+        remove_connection(port, AF_INET, d1);
+        CHECK(is_connection_tracked(port, AF_INET, d1) == FALSE, "d1 removed");
+        CHECK(is_connection_tracked(port, AF_INET, d2) == TRUE, "d2 sibling survives");
+        remove_connection(port, AF_INET, d2);
+        CHECK(is_connection_tracked(port, AF_INET, d2) == FALSE, "d2 removed");
+
+        // IPv6 條目與同埠 IPv4 條目互不干擾
+        UINT8 v6dst[16] = {0x20,0x01,0x48,0x60,0,0,0,0,0,0,0,0,0,0,0,0x01};
+        add_connection(port, AF_INET6, src, v6dst, 443, 5, RULE_ACTION_PROXY, FALSE);
+        CHECK(is_connection_tracked(port, AF_INET, v6dst) == FALSE, "v6 entry invisible to v4 key");
+        CHECK(is_connection_tracked(port, AF_INET6, v6dst) == TRUE, "v6 entry found by v6 key");
+        remove_connection(port, AF_INET6, v6dst);
+    }
+
+    printf("== [回歸] 舊埠 stale PROXY 條目不得綁架新目的地連線 ==\n");
+    {
+        // Gpc/CODEX 情境: app 異常關閉 (無 FIN/RST), conntrack 殘留
+        // (port -> 舊目的地, PROXY); OS 把同一臨時埠發給新 socket,
+        // 新連線要去內網主機。port-only key 下此封包會被誤送進 relay。
+        UINT8 src[16] = {192, 168, 1, 10};
+        UINT8 old_dst[16] = {93, 184, 216, 34};   // 舊外部伺服器
+        UINT8 lan_dst[16] = {192, 168, 1, 1};     // 新連線其實要去內網
+        UINT16 port = 51234;
+
+        add_connection(port, AF_INET, src, old_dst, 443, 7, RULE_ACTION_PROXY, FALSE);
+
+        CHECK(is_connection_tracked(port, AF_INET, old_dst) == TRUE, "old flow still tracked");
+        CHECK(is_connection_tracked(port, AF_INET, lan_dst) == FALSE,
+              "new dest NOT hijacked by stale port entry");
+        CHECK(get_connection(port, AF_INET, lan_dst, NULL, NULL, NULL, NULL, NULL) == FALSE,
+              "new dest lookup misses -> reaches rule/LAN evaluation");
+
+        remove_connection(port, AF_INET, old_dst);
     }
 
     printf("== UDP 多目的地 (同 socket 送多個伺服器) ==\n");
@@ -75,9 +120,9 @@ int main(void)
         CHECK(proxy_id == 8, "dest2 keeps its own proxy id");
         CHECK(get_connection_udp(port, AF_INET6, dns1, &dport, &proxy_id) == FALSE, "family mismatch -> miss");
 
-        // UDP 條目不得被 TCP 查詢/移除路徑誤刪
-        CHECK(is_connection_tracked(port) == FALSE, "TCP lookup skips UDP entries");
-        remove_connection(port);
+        // UDP 條目不得被 TCP 查詢/移除路徑誤刪 (同埠 + 同目的地也不行)
+        CHECK(is_connection_tracked(port, AF_INET, dns1) == FALSE, "TCP lookup skips UDP entries");
+        remove_connection(port, AF_INET, dns1);
         CHECK(is_connection_tracked_udp(port, AF_INET, dns1) == TRUE, "TCP remove keeps UDP entry");
 
         // 回應改寫用的 per-app-port 查詢: 找得到任一 UDP 條目的目的 port
