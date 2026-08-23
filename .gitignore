@@ -41,3 +41,7 @@ config.json.corrupt.bak
 
 # pytest
 .pytest_cache/
+
+# Nuitka launcher byproducts (repo root)
+/IntegratedApp.exe
+/IntegratedApp.cmd
