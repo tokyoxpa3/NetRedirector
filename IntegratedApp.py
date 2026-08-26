@@ -29,8 +29,9 @@ from tabs_hub import HubTabMixin
 from tabs_rules import RulesTabMixin
 from tabs_proxies import ProxiesTabMixin
 from tabs_monitor import MonitorTabMixin
+from tabs_vpngate import VpnGateTabMixin
 
-class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, MonitorTabMixin):
+class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, MonitorTabMixin, VpnGateTabMixin):
     update_proxy_table_signal = Signal() 
     CONFIG_FILE = "config.json"  # [新增] 設定檔路徑
 
@@ -397,6 +398,11 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.tabs.addTab(self.tab_monitor, "")
         self._reg("tab", self.tabs, 3, "4. 流量監控 (Monitor)")
 
+        self.tab_vpngate = QWidget()
+        self.setup_vpngate_tab()
+        self.tabs.addTab(self.tab_vpngate, "")
+        self._reg("tab", self.tabs, 4, "5. VPN Gate 節點派發")
+
         log_group = QGroupBox("")
         self._reg("title", log_group, "系統日誌")
         log_layout = QVBoxLayout()
@@ -420,6 +426,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         proxy_core.route_manager.sync_interfaces(interfaces)
         if self.tabs.currentIndex() == 0:
             self.refresh_hub_table()
+        if hasattr(self, 'table_vpn_nics'):
+            self._vpn_update_live_status()
 
     def on_traffic_event(self, process, pid, ip, port, info):
         if pid == os.getpid():

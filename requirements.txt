@@ -1,3 +1,4 @@
 # 執行期相依 (runtime) — 已釘版,避免上游大版升級破壞 GUI/打包
 # 升級前請先在分支驗證: python -m pytest && .\build.ps1 -Standalone
 PySide6==6.11.1
+requests>=2.31.0

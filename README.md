@@ -15,7 +15,7 @@
 
 ## 📸 介面預覽 (UI Gallery)
 
-> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下，並於下方表格中引用（目前使用 `1.png`、`2-1.png`、`2-2.png`、`3-1.png`、`3-2.png`、`4.png`）。*
+> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下，並於下方表格中引用（目前使用 `1.png`、`2-1.png`、`2-2.png`、`3-1.png`、`3-2.png`、`4.png`；VPN Gate 分頁可新增 `5.png` 引用）。*
 
 | 1. 端口路由管理 (Hub) | 2. 進程攔截規則 (Rules) |
 | :---: | :---: |
@@ -61,6 +61,11 @@
 - 內建優化的 `network_utils` 模組，取代傳統緩慢的 cmd `ping` / `ipconfig` 命令，提供毫秒級網路介面檢測與即時延遲監控。
 - 支援右鍵點擊即時流量記錄，一鍵快速新增進程攔截規則。
 
+### 7. VPN Gate 節點自動派發 (VPN Gate 分頁)
+- 抓取 [VPN Gate](https://www.vpngate.net/) 即時公開中繼節點清單，依速度/評分排序。
+- 支援篩選：排除 `public-*` 節點、排除 port 443、最低速度門檻、指定國家。
+- 對 SoftEther 虛擬網卡（`vpncmd.exe`）一鍵自動設定、連線並驗證 tunnel 通網；單一節點失敗自動換下一個候選。
+
 ---
 
 ## 🛠️ 系統需求
@@ -68,6 +73,7 @@
 - **作業系統**：Windows 10 / 11 (x64)
 - **運行權限**：**管理員權限 (Administrator)**（WinDivert 驅動程式攔截網路封包必須）
 - **執行環境**：Python 3.10+ (推薦 Python 3.11)
+- **VPN Gate 分頁 (選用)**：需安裝 [SoftEther VPN Client](https://www.vpngate.net/cn/download.aspx)（`vpncmd.exe`，簡體中文版 v4.44）。
 
 ---
 
@@ -133,6 +139,22 @@
 1. 查看即時產生的網路流量記錄（包含時間、進程名稱、PID、來源/目標 IP 與端口）。
 2. 支援 **滑鼠右鍵點擊** 任意流量記錄行，彈出快捷選單，一鍵將該進程或目標加入攔截規則中。
 
+### 五、 VPN Gate 節點派發 (VPN Gate 分頁)
+
+> **前置需求**：需安裝 [SoftEther VPN Client](https://www.vpngate.net/cn/download.aspx)（`vpncmd.exe`，簡體中文版 v4.44），並已透過 VPN Client Manager 建立至少一張虛擬網卡。
+
+1. **重新整理網卡**：點擊「重新整理網卡」列出所有 SoftEther 虛擬網卡，狀態欄以綠/紅顯示上線/離線。
+2. **抓取節點**：點擊「抓取節點」從 [VPN Gate](https://www.vpngate.net/) 即時清單（`http://www.vpngate.net/api/iphone/`）取得公開中繼節點；Port 欄位從 OpenVPN 設定 base64 解碼後的 `remote` 行取出（SoftEther 與 OpenVPN 共用同一 listener）。
+3. **設定篩選條件**：預設排除 `public-*` 節點與 port 443；可調整最低速度門檻（Mbps）及多選指定國家（留空=全部）。
+4. **套用篩選**：依條件過濾，以 `(-score, ping)` 排序候選節點。
+5. **一鍵上線**：自動對所有**離線**網卡依序指派候選節點：`AccountSet`（或 `AccountCreate`）→ 匿名認證（HUB=`VPNGATE`，使用者名稱=`vpn`）→ `AccountConnect` → 輪詢 `AccountStatusGet` 等待會話建立 → 取得網卡 IPv4 → 綁定該 IP 連 `1.1.1.1:443` 驗證 tunnel 通網；單一節點失敗自動斷線換下一個候選，本輪已用 IP 不會重複嘗試。
+
+> **注意事項**
+> - 抓取、連線等慢速操作皆在背景執行緒執行，請留意系統日誌進度。
+> - VPN Gate 節點為公開免費中繼，速度與穩定性不保證；連線失敗屬正常流程，工具會自動嘗試下一個節點。
+> - `vpncmd` 命令參數**不可用引號包裹**，否則會報「命令未找到」；`softether.py` 已正確處理此行為。
+> - 錯誤碼 `rc=37`（指定設定未連接）是 `AccountStatusGet` 對離線帳號的正常回傳，`is_connected()` 會正確回傳 `False`，不會影響流程。
+
 ---
 
 ## 🗂️ 專案檔案結構
@@ -143,6 +165,10 @@ NetRedirector/
 ├── proxy_core.py            # 本地 SOCKS5 / 端口路由代理核心
 ├── network_utils.py         # 高效網路介面掃描與 Ping 診斷模組
 ├── NetRedirector.py         # WinDivert C 核心 Python 封裝器
+├── tabs_vpngate.py          # VPN Gate 節點派發分頁 (PySide6)
+├── vpngate.py               # VPN Gate 即時節點清單抓取/解析/排序
+├── softether.py             # SoftEther vpncmd.exe 封裝 (連線/斷線/狀態)
+├── vpngate_config.py        # VPN Gate 相關常數 (vpncmd 路徑、HUB、timeout)
 ├── requirements.txt         # Python 相依套件清單
 ├── NetRedirector.dll        # 核心 C 語言 DLL (封包攔截與轉發)
 ├── WinDivert.dll            # WinDivert 動態連結庫
@@ -206,6 +232,8 @@ NetRedirector/
    - A: NetRedirector 內建「智慧局域網自動直連」功能，通常會自動放行私有網段。若仍有異常，請檢查規則分頁中是否有設定全域阻擋或覆蓋規則。
 3. **Q: 支援遊戲加速或指定進程代理嗎？**
    - A: 支援。透過「進程攔截規則」指定遊戲主程式（如 `game.exe`）並套用 SOCKS5 代理即可實現精準遊戲加速。
+4. **Q: VPN Gate 分頁抓不到節點或連線失敗？**
+   - A: 抓不到節點時請確認本機可連線至 `www.vpngate.net` 再點擊「抓取節點」（節點清單偶爾會短暫不可用）。連線失敗屬正常流程，工具會自動換節點；若長期無可用節點，可調低「最低速度」門檻或取消「排除 port 443」。請確認已安裝簡體中文版 v4.44 的 SoftEther VPN Client，並已建立虛擬網卡。
 
 ---
 
