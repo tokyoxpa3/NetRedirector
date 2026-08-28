@@ -10,15 +10,17 @@ import os
 import secure_config
 
 
-def build_config_data(lang, ping_target, hubs, custom_proxies, rules):
+def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies, rules):
     """把執行期狀態序列化為 config.json 結構。
 
     - Proxy: 移除動態數據 (latency/ID)，密碼以 DPAPI 加密
     - Rules: 保存 Proxy 的 UI 辨識字串 (例如 "[Custom] MyVPN") 而非動態 ID
+    - minimize_to_tray: 關閉視窗時是否縮到系統匣
     """
     config_data = {
         "lang": lang,
         "ping_target": ping_target,
+        "minimize_to_tray": bool(minimize_to_tray),
         "hubs": hubs or {},
         "proxies": [],
         "rules": [],

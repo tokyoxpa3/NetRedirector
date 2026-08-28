@@ -127,18 +127,27 @@ class NetworkMonitorWorker(QThread):
         super().__init__()
         self.running = True
         self.ping_target = ping_target
+        self.ping_enabled = True      # 是否測延遲 (由主視窗依當前分頁控制)
+        self._last_latency = None      # 最近一次延遲結果，停用 ping 期間沿用
 
     def set_ping_target(self, target):
         self.ping_target = target
 
+    def set_ping_enabled(self, enabled):
+        self.ping_enabled = enabled
+
     def run(self):
         while self.running:
             interfaces = network_utils.get_system_interfaces()
+
+            # 每輪只 ping 一次目標 (延遲對所有網卡一致，因 ping_address 未綁定來源 IP)；
+            # 僅在分頁需要顯示延遲時才 ping，否則沿用上次結果，避免整輪阻塞。
+            if self.ping_enabled:
+                self._last_latency = network_utils.ping_address("", self.ping_target)
+            latency = self._last_latency
+
             for name, details in interfaces.items():
-                if details['connected']:
-                    details['latency'] = network_utils.ping_address(details['ipv4'], self.ping_target)
-                else:
-                    details['latency'] = 9999
+                details['latency'] = latency if (latency is not None and details['connected']) else 9999
 
             self.data_updated.emit(interfaces)
             for _ in range(30):

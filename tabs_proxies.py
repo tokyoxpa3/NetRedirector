@@ -108,7 +108,13 @@ class ProxiesTabMixin:
         cols = ["ID", "名稱", "類型", "IP:Port", "驗證", "延遲"]
         self.table_custom_proxies.setColumnCount(len(cols))
         self._reg("headers", self.table_custom_proxies, cols)
+        # 短欄位依內容自動收合，名稱(變動文字)才伸展
         self.table_custom_proxies.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table_custom_proxies.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_custom_proxies.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_custom_proxies.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_custom_proxies.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.table_custom_proxies.setColumnWidth(5, 200)
         self.table_custom_proxies.setColumnHidden(0, True)
         self.table_custom_proxies.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_custom_proxies.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -313,5 +319,4 @@ class ProxiesTabMixin:
                 lat_item.setForeground(QBrush(QColor("gray")))
             self.table_custom_proxies.setItem(row, 5, lat_item)
         self.table_custom_proxies.verticalScrollBar().setValue(scroll)
-        self.table_custom_proxies.resizeColumnToContents(5)
 

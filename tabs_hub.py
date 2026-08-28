@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTableWidget, QTableWidgetItem,
                              QPushButton, QLabel, QGroupBox, QSpinBox, QTextEdit,
                              QListWidget, QSplitter, QMessageBox, QHeaderView,
-                             QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu)
+                             QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
+                             QAbstractItemView)
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QAction
 
@@ -44,6 +45,8 @@ class HubTabMixin:
         input_layout.addWidget(btn_add)
         
         self.list_hub_ports = QListWidget()
+        # 多選:按住 Ctrl/Shift 可同時選取多個端口，啟動/刪除會作用於所有選中項
+        self.list_hub_ports.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_hub_ports.itemClicked.connect(self.on_hub_port_selected)
         
         btn_del = QPushButton("")
@@ -81,9 +84,17 @@ class HubTabMixin:
         right_layout.addLayout(filter_layout)
 
         self.table_hub = QTableWidget()
+        # 綁定表格僅供勾選，不允許編輯文字
+        self.table_hub.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_hub.setColumnCount(5)
         self._reg("headers", self.table_hub, ["綁定", "介面名稱", "IP", "延遲", "負載"])
+        # 短欄位依內容自動收合，介面名稱(變動文字)才伸展
+        self.table_hub.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table_hub.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table_hub.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_hub.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.table_hub.setColumnWidth(3, 80)
+        self.table_hub.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table_hub.cellClicked.connect(self.on_hub_table_click)
 
         right_layout.addWidget(self.table_hub)
@@ -103,21 +114,31 @@ class HubTabMixin:
         self.sync_hub_proxy(port)
 
     def del_hub_port(self):
-        item = self.list_hub_ports.currentItem()
-        if not item: return
-        port = int(item.text().split()[0])
-        proxy_core.server_controller.stop_port(port)
-        if port in self.port_config: del self.port_config[port]
-        # [Fixed] 同步刪除 DLL 中的 Hub 代理設定，避免殘留幽靈代理
-        # (sync_hub_proxy 曾對每個 Hub 端口呼叫 add_proxy 註冊代理)
-        pid = self.hub_proxy_map.pop(port, None)
-        if pid and hasattr(self.bridge.lib, 'NetRedirector_DeleteProxyConfig'):
-            try:
-                self.bridge.lib.NetRedirector_DeleteProxyConfig(pid)
-                self.append_log(f"已移除 Hub 端口 {port} 的 DLL 代理設定 (ID: {pid})")
-            except Exception as e:
-                self.append_log(f"移除 Hub 端口代理設定失敗: {e}")
-        self.list_hub_ports.takeItem(self.list_hub_ports.row(item))
+        items = self.list_hub_ports.selectedItems()
+        if not items:
+            item = self.list_hub_ports.currentItem()
+            if item:
+                items = [item]
+        if not items:
+            return
+        ports = [int(it.text().split()[0]) for it in items]
+        for port in ports:
+            proxy_core.server_controller.stop_port(port)
+            if port in self.port_config: del self.port_config[port]
+            # [Fixed] 同步刪除 DLL 中的 Hub 代理設定，避免殘留幽靈代理
+            # (sync_hub_proxy 曾對每個 Hub 端口呼叫 add_proxy 註冊代理)
+            pid = self.hub_proxy_map.pop(port, None)
+            if pid and hasattr(self.bridge.lib, 'NetRedirector_DeleteProxyConfig'):
+                try:
+                    self.bridge.lib.NetRedirector_DeleteProxyConfig(pid)
+                    self.append_log(f"已移除 Hub 端口 {port} 的 DLL 代理設定 (ID: {pid})")
+                except Exception as e:
+                    self.append_log(f"移除 Hub 端口代理設定失敗: {e}")
+        # 從清單移除對應項目 (依實際 item 物件，避免索引位移問題)
+        for it in items:
+            row = self.list_hub_ports.row(it)
+            if row >= 0:
+                self.list_hub_ports.takeItem(row)
         self.selected_hub_port = None
         self.refresh_hub_table()
         self.refresh_proxy_combobox()
@@ -128,16 +149,28 @@ class HubTabMixin:
         self.update_hub_status()
         self.refresh_hub_table()
 
+    def selected_hub_ports(self):
+        """回傳目前清單中被選取的所有端口 (依清單順序)。"""
+        return [int(self.list_hub_ports.item(i).text().split()[0])
+                for i in range(self.list_hub_ports.count())
+                if self.list_hub_ports.item(i).isSelected()]
+
     def apply_hub_config(self):
-        if not self.selected_hub_port: return
-        port = self.selected_hub_port
-        interfaces = self.port_config.get(port, [])
-        proxy_core.route_manager.update_port_binding(port, interfaces)
-        success = proxy_core.server_controller.start_port(port)
-        self.update_hub_list_item(port, success)
-        if success:
-            self.sync_hub_proxy(port)
-            logging.info(f"Hub 端口 {port} 已啟動")
+        ports = self.selected_hub_ports()
+        if not ports:
+            # 無選取時沿用舊行為：以最後點選的端口為準
+            if self.selected_hub_port:
+                ports = [self.selected_hub_port]
+            else:
+                return
+        for port in ports:
+            interfaces = self.port_config.get(port, [])
+            proxy_core.route_manager.update_port_binding(port, interfaces)
+            success = proxy_core.server_controller.start_port(port)
+            self.update_hub_list_item(port, success)
+            if success:
+                self.sync_hub_proxy(port)
+                logging.info(f"Hub 端口 {port} 已啟動")
 
     def sync_hub_proxy(self, port):
         if port in self.hub_proxy_map: return
@@ -214,13 +247,19 @@ class HubTabMixin:
             self.append_log(f"已批次更新端口 {self.selected_hub_port} 的綁定介面")
 
     def on_hub_table_click(self, row, col):
-        if col == 0 and self.selected_hub_port:
-            name = self.table_hub.item(row, 1).text()
-            item = self.table_hub.item(row, 0)
-            checked = (item.checkState() == Qt.CheckState.Checked)
-            curr = self.port_config.get(self.selected_hub_port, [])
-            if checked and name not in curr: curr.append(name)
-            elif not checked and name in curr: curr.remove(name)
-            self.port_config[self.selected_hub_port] = curr
-            proxy_core.route_manager.update_port_binding(self.selected_hub_port, curr)
+        if not self.selected_hub_port: return
+        name = self.table_hub.item(row, 1).text()
+        chk_item = self.table_hub.item(row, 0)
+        if col == 0:
+            # 點到勾選框時 Qt 已自動切換狀態，直接讀取新狀態
+            checked = (chk_item.checkState() == Qt.CheckState.Checked)
+        else:
+            # 點到其他欄位時改為手動切換勾選，達成「點整列即可勾選」
+            checked = (chk_item.checkState() != Qt.CheckState.Checked)
+            chk_item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        curr = self.port_config.get(self.selected_hub_port, [])
+        if checked and name not in curr: curr.append(name)
+        elif not checked and name in curr: curr.remove(name)
+        self.port_config[self.selected_hub_port] = curr
+        proxy_core.route_manager.update_port_binding(self.selected_hub_port, curr)
 

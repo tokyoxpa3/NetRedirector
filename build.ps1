@@ -189,6 +189,17 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# exe 圖示: 若 assets/app_icon.ico 不存在，先以 app_icon.py 產生
+$iconPath = Join-Path $ScriptDir "assets\app_icon.ico"
+if (-not (Test-Path $iconPath)) {
+    Write-Host "  產生 exe 圖示..." -ForegroundColor Gray
+    & $pythonExe (Join-Path $ScriptDir "app_icon.py")
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $iconPath)) {
+        Write-Error "產生 exe 圖示失敗 (assets/app_icon.ico 不存在)"
+        exit 1
+    }
+}
+
 # 建構 Nuitka 命令
 # [Fixed] 使用 splatting (& $pythonExe @nuitkaArgs): Windows PowerShell 5.1 的
 # 「& $陣列變數」不會展開成指令+參數, 會把整個陣列當成單一指令名稱而失敗
@@ -201,7 +212,8 @@ $nuitkaArgs = @(
     # 下載提示在非互動環境會自動答 "no" 而 FATAL; 此旗標讓它自動下載
     "--assume-yes-for-downloads",
     "--enable-plugin=pyside6",
-    "--include-data-dir=locale=locale"
+    "--include-data-dir=locale=locale",
+    "--windows-icon-from-ico=assets\app_icon.ico"
 )
 
 if (-not $ConsoleMode) {

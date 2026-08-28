@@ -324,8 +324,15 @@ class ServerController:
                 logging.error(f"停止 Port {port} 時發生錯誤: {e}")
 
     def stop_all(self):
+        # 平行停止所有監聽端口：每個 shutdown() 最多阻塞一個 poll interval
+        # (約 0.5 秒)。若按序停止，N 個端口會累加出 N×0.5 秒的關閉延遲；
+        # 平行化後總時間只等最慢的那一個。各端口使用獨立 socket 與
+        # serve_forever 執行緒，彼此無共享狀態，並行關閉安全。
         ports = list(self.servers.keys())
-        for p in ports:
-            self.stop_port(p)
+        threads = [threading.Thread(target=self.stop_port, args=(p,), daemon=True) for p in ports]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
 server_controller = ServerController()

@@ -12,6 +12,7 @@ Usage:
     print(se.account_status("VPN12"))
 """
 
+import re
 import subprocess
 
 import vpngate_config as config
@@ -78,6 +79,33 @@ class SoftEtherClient:
             if line.startswith("VPN 连接设置名称"):
                 names.append(line.split("|", 1)[1].strip())
         return names
+
+    def account_servers(self) -> dict[str, tuple[str, int]]:
+        """單次 AccountList 解析出 虛擬網卡名 -> (host, port)。
+
+        AccountList 的輸出已含每個帳號的 server 主機/埠 (欄位
+        「VPN Server 主机名(地址)」) 與對應的虛擬網卡名，故不需要
+        再對每個帳號個別呼叫 AccountGet，可將 refresh 的 vpncmd
+        子程序呼叫數從 2+N 降到 2。
+        """
+        out = self.run("AccountList")
+        mapping: dict[str, tuple[str, int]] = {}
+        ip_port = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
+        pending_server = None
+        for line in out.splitlines():
+            if "|" not in line:
+                continue
+            key, _, val = line.partition("|")
+            key = key.strip()
+            val = val.strip()
+            if key.startswith("VPN Server 主机名"):
+                m = ip_port.match(val)
+                if m:
+                    pending_server = (m.group(1), int(m.group(2)))
+            elif key.startswith("虚拟网络适配器名") and pending_server:
+                mapping[val] = pending_server
+                pending_server = None
+        return mapping
 
     def account_status(self, name: str) -> dict:
         """Return parsed AccountStatusGet fields."""

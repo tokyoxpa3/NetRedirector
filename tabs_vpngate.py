@@ -18,8 +18,8 @@ import time
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
                                QTableWidgetItem, QPushButton, QLabel, QGroupBox,
                                QCheckBox, QSpinBox, QListWidget, QHeaderView,
-                               QMessageBox)
-from PySide6.QtCore import QTimer
+                               QMessageBox, QSplitter)
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QBrush
 
 from i18n import i18n as tr
@@ -87,6 +87,7 @@ def _wait_connected(se, nic, timeout=None):
 class VpnGateTabMixin:
     def setup_vpngate_tab(self):
         layout = QHBoxLayout(self.tab_vpngate)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ---------- 左: NIC 清單 ----------
         left_panel = QGroupBox("")
@@ -97,7 +98,9 @@ class VpnGateTabMixin:
         self.table_vpn_nics.setColumnCount(3)
         self._reg("headers", self.table_vpn_nics,
                   ["網卡名", "狀態", "伺服器"])
-        self.table_vpn_nics.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # 固定欄位依內容自動收合 (i18n 安全)，伺服器(IP:port)變動欄位才伸展
+        self.table_vpn_nics.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_vpn_nics.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table_vpn_nics.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table_vpn_nics.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_vpn_nics.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -116,7 +119,7 @@ class VpnGateTabMixin:
         left_layout.addLayout(nic_btns)
 
         left_panel.setLayout(left_layout)
-        layout.addWidget(left_panel, 1)
+        splitter.addWidget(left_panel)
 
         # ---------- 右: 節點清單 + 篩選 ----------
         right_panel = QGroupBox("")
@@ -169,24 +172,33 @@ class VpnGateTabMixin:
         right_layout.addLayout(node_btns)
 
         self.table_vpn_nodes = QTableWidget()
-        self.table_vpn_nodes.setColumnCount(7)
+        self.table_vpn_nodes.setColumnCount(8)
         self._reg("headers", self.table_vpn_nodes,
-                  ["主機名", "IP", "Port", "Score", "Ping", "速度", "國家"])
+                  ["主機名", "IP", "Port", "Score", "Ping", "速度", "國家", "失敗"])
+        # 短數值欄位依內容自動收合 (IP/Port/Score/Ping/速度/失敗)，主機名與國家等長文字才伸展
         self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.table_vpn_nodes.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self.table_vpn_nodes.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_vpn_nodes.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         right_layout.addWidget(self.table_vpn_nodes, 1)
 
         right_panel.setLayout(right_layout)
-        layout.addWidget(right_panel, 2)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
 
         # ---------- 背景執行緒 → UI 佇列 ----------
         self.vpn_queue = queue.Queue()
         self.vpn_se = softether.SoftEtherClient()
         self.vpn_all_nodes = []
         self.vpn_candidates = []
-        self.vpn_failed_ips = set()
+        self.vpn_fail_count = {}  # ip -> 連續失敗次數，成功後歸零
         self.vpn_timer = QTimer()
         self.vpn_timer.timeout.connect(self._vpn_poll_queue)
         self.vpn_timer.start(100)
@@ -226,13 +238,11 @@ class VpnGateTabMixin:
 
         def work():
             nics = self.vpn_se.nic_list()
-            accounts = set(self.vpn_se.account_list())
+            servers = self.vpn_se.account_servers()
             rows = []
             for nic in nics:
-                server_s = ""
-                if nic in accounts:
-                    server = self.vpn_se.account_server(nic)
-                    server_s = f"{server[0]}:{server[1]}" if server else ""
+                srv = servers.get(nic)
+                server_s = f"{srv[0]}:{srv[1]}" if srv else ""
                 rows.append((nic, server_s))
             return rows
 
@@ -301,9 +311,13 @@ class VpnGateTabMixin:
 
     def _vpn_assign_nics(self, nics):
         results = {}
-        failed = self.vpn_failed_ips
+        failed = self.vpn_fail_count
         used_ips = self._vpn_used_server_ips(exclude=set(nics))
-        candidates = sorted(self.vpn_candidates, key=lambda n: n.ip in failed)
+        # 失敗次數高的排到最後，避免一直重試有問題的節點
+        candidates = sorted(
+            self.vpn_candidates,
+            key=lambda n: (failed.get(n.ip, 0), -n.score),
+        )
         cursor = 0
         max_attempts = 10
         for nic in nics:
@@ -324,9 +338,10 @@ class VpnGateTabMixin:
                 if self._vpn_assign_one(nic, node):
                     results[nic] = node
                     used_ips.add(node.ip)
+                    failed.pop(node.ip, None)  # 連線成功，失敗計數歸零
                     assigned = True
                 else:
-                    failed.add(node.ip)
+                    failed[node.ip] = failed.get(node.ip, 0) + 1
             if not assigned:
                 self._vpn_post(self._vpn_log, f"  X 無法為 {nic} 指派可用節點")
         return results
@@ -355,6 +370,7 @@ class VpnGateTabMixin:
     def _vpn_after_assign(self, results):
         for nic, node in (results or {}).items():
             self._vpn_log(f"  ✓ {nic}: {node.hostname} {node.ip}:{node.port} ({node.country_long})")
+        self._vpn_render_nodes(self.vpn_candidates)
         self.vpn_refresh_nics()
 
     # --------------------------------------------------------- 節點面板
@@ -364,7 +380,6 @@ class VpnGateTabMixin:
 
     def _vpn_on_nodes(self, nodes):
         self.vpn_all_nodes = nodes or []
-        self.vpn_failed_ips.clear()
         self._vpn_fill_countries()
         self.vpn_apply_filters()
         self._vpn_log(f"抓到 {len(self.vpn_all_nodes)} 個節點")
@@ -408,3 +423,4 @@ class VpnGateTabMixin:
             self.table_vpn_nodes.setItem(row, 4, QTableWidgetItem(f"{n.ping_ms}ms"))
             self.table_vpn_nodes.setItem(row, 5, QTableWidgetItem(f"{n.speed_bps / 1e6:.0f}M"))
             self.table_vpn_nodes.setItem(row, 6, QTableWidgetItem(n.country_long))
+            self.table_vpn_nodes.setItem(row, 7, QTableWidgetItem(str(self.vpn_fail_count.get(n.ip, 0))))

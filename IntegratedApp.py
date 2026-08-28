@@ -9,11 +9,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTableWidget, QTableWidgetItem, 
                              QPushButton, QLabel, QGroupBox, QSpinBox, QTextEdit, 
                              QListWidget, QSplitter, QMessageBox, QHeaderView,
-                             QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu)
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QBrush, QAction
+                             QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
+                             QSystemTrayIcon, QCheckBox)
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
 from i18n import i18n as tr, SUPPORTED_LANGS
+
+from app_icon import get_app_icon
+import single_instance
 
 # 匯入現有的模組
 import network_utils
@@ -41,6 +45,16 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.setWindowTitle(self.t("NetRedirector x GameProxyHub 整合專業版"))
         self._reg("window", self, "NetRedirector x GameProxyHub 整合專業版")
         self.resize(1024, 768)
+
+        # 應用程式圖示 (工作列/視窗/tray 共用)
+        self._app_icon = get_app_icon()
+        self.setWindowIcon(self._app_icon)
+
+        # 系統匣與關閉行為狀態
+        self._really_quit = False      # True 時關閉即真正離開程式
+        self._tray_notified = False    # 是否已顯示過「縮到匣」提示
+        self._tray_icon = None         # QSystemTrayIcon 實例 (延後於 setup_ui 後建立)
+
         dll_path = "NetRedirector.dll"
         
         try:
@@ -86,11 +100,18 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         # UI 初始化
         self.setup_ui()
-        
+
+        # 系統匣 (需在 setup_ui 之後，chkbox 已存在；且需有 QApplication)
+        self._setup_tray()
+
         # 啟動網路監控
         self.monitor_thread = NetworkMonitorWorker(self.ping_target)
         self.monitor_thread.data_updated.connect(self.on_network_update)
         self.monitor_thread.start()
+
+        # 依當前分頁啟用/停用延遲 ping (僅 Hub 分頁需要)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.on_tab_changed(self.tabs.currentIndex())
         
         # Log Handler
         self.log_handler = SignalLogHandler()
@@ -172,6 +193,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.monitor_thread.set_ping_target(target)
             self.append_log(f"Ping 目標已更新: {target}")
 
+    def on_tab_changed(self, index):
+        # 只有 Hub 分頁需要即時介面延遲顯示；其餘分頁停用延遲 ping，
+        # 但網卡掃描與路由同步仍持續進行 (見 NetworkMonitorWorker.run)
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread.set_ping_enabled(index == 0)
+
     def update_service_status(self):
         running = self.is_redirector_running
         self.btn_master_switch.setText(
@@ -213,7 +240,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     # [模組化] 儲存設定 (序列化/檔案 I/O 移至 config_store)
     def save_config(self):
         data = config_store.build_config_data(
-            tr.lang, self.ping_target, self.port_config, self.custom_proxies, self.rules)
+            tr.lang, self.ping_target,
+            self.chk_minimize_to_tray.isChecked() if hasattr(self, 'chk_minimize_to_tray') else False,
+            self.port_config, self.custom_proxies, self.rules)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
             self.append_log("設定已儲存至 config.json")
@@ -245,6 +274,10 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 self.monitor_thread.set_ping_target(saved_ping)
                 if hasattr(self, 'ent_ping_target'):
                     self.ent_ping_target.setText(saved_ping)
+
+            # 還原「關閉時縮到系統匣」
+            if hasattr(self, 'chk_minimize_to_tray'):
+                self.chk_minimize_to_tray.setChecked(bool(data.get("minimize_to_tray", False)))
 
             self.append_log("正在還原設定...")
 
@@ -369,10 +402,16 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.ent_ping_target.setToolTip("網路介面延遲偵測的 Ping 目標 (IP 或域名)")
         self.ent_ping_target.editingFinished.connect(self.on_ping_target_changed)
 
+        self.chk_minimize_to_tray = QCheckBox("")
+        self._reg("text", self.chk_minimize_to_tray, "關閉時縮到系統匣")
+        self.chk_minimize_to_tray.setChecked(False)
+        self.chk_minimize_to_tray.setToolTip(self.t("勾選後，按關閉會直接縮到系統匣，不詢問"))
+
         top_bar.addStretch()
         top_bar.addWidget(lbl_ping)
         top_bar.addWidget(self.ent_ping_target)
         top_bar.addWidget(self.combo_lang)
+        top_bar.addWidget(self.chk_minimize_to_tray)
         main_layout.addLayout(top_bar)
 
         self.tabs = QTabWidget()
@@ -452,24 +491,168 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         c.movePosition(c.MoveOperation.End)
         self.txt_log.setTextCursor(c)
 
-    # [新增] 在關閉時儲存設定
-    def closeEvent(self, event):
-        self.save_config() # 儲存設定
+    # --------------------------------------------------------- 系統匣
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = None
+            return
+        self._tray_icon = QSystemTrayIcon(self._app_icon, self)
+        self._tray_icon.setToolTip(self.t("NetRedirector x GameProxyHub 整合專業版"))
+
+        menu = QMenu()
+        act_show = menu.addAction(self.t("顯示主視窗"))
+        act_show.triggered.connect(self._restore_from_tray)
+        act_quit = menu.addAction(self.t("完全關閉程式"))
+        act_quit.triggered.connect(self._quit_from_tray)
+        self._tray_icon.setContextMenu(menu)
+
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        # 單擊/雙擊 tray 圖示都還原視窗
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    # 最小化時也縮到系統匣 (迅雷式行為)
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange
+                and self.isMinimized()
+                and self._tray_icon is not None):
+            # 延後執行，避免在視窗狀態事件內直接 hide 造成閃爍/狀態錯亂
+            QTimer.singleShot(0, self._hide_to_tray)
+
+    def _hide_to_tray(self):
+        self.hide()
+        if self._tray_icon and not self._tray_notified:
+            self._tray_icon.showMessage(
+                self.t("NetRedirector"),
+                self.t("程式已縮到系統匣繼續運作，點擊圖示可重新開啟。"),
+                QSystemTrayIcon.MessageIcon.Information, 3000,
+            )
+            self._tray_notified = True
+
+    def _quit_from_tray(self):
+        self._really_quit = True
+        try:
+            self._perform_shutdown()
+        finally:
+            # 直接退出事件迴圈，避免視窗已隱藏(縮到匣)時 close() 未觸發 closeEvent 而卡住
+            QApplication.instance().quit()
+
+    def _perform_shutdown(self):
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
+
+        # [診斷] 逐段計時寫入 shutdown_timing.log，定位關閉慢的步驟
+        marks = []
+        t0 = time.perf_counter()
+
+        self.save_config()
+        marks.append(("save_config", time.perf_counter() - t0))
+
+        t1 = time.perf_counter()
         self.monitor_thread.stop()
+        marks.append(("monitor_thread.stop", time.perf_counter() - t1))
+
+        t2 = time.perf_counter()
         if self.is_redirector_running:
             self.bridge.stop()
+        marks.append(("bridge.stop", time.perf_counter() - t2))
+
+        t3 = time.perf_counter()
         proxy_core.server_controller.stop_all()
-        event.accept()
+        marks.append(("server.stop_all", time.perf_counter() - t3))
+
+        if self._tray_icon:
+            self._tray_icon.hide()
+
+        try:
+            with open("shutdown_timing.log", "w", encoding="utf-8") as f:
+                for name, dt in marks:
+                    f.write(f"{name}: {dt*1000:.0f} ms\n")
+        except OSError:
+            pass
+
+    # [新增] 關閉視窗：視「縮到系統匣」設定決定直接離開、直接縮匣或詢問
+    def closeEvent(self, event):
+        if self._really_quit:
+            self._perform_shutdown()
+            event.accept()
+            return
+
+        # 系統匣不可用時，直接正常關閉
+        if self._tray_icon is None:
+            self._perform_shutdown()
+            event.accept()
+            return
+
+        if self.chk_minimize_to_tray.isChecked():
+            self._hide_to_tray()
+            event.ignore()
+            return
+
+        # 詢問：完全關閉 or 縮到系統匣 (二選一，無取消/記住選項)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(self.t("關閉 NetRedirector"))
+        box.setText(self.t("要完全關閉程式，還是縮到系統匣？"))
+        btn_quit = box.addButton(self.t("完全關閉"), QMessageBox.ButtonRole.DestructiveRole)
+        btn_tray = box.addButton(self.t("縮到系統匣"), QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(btn_tray)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is btn_quit:
+            self._perform_shutdown()
+            event.accept()
+            return
+        if clicked is btn_tray:
+            # 連動介面上的設定：下次按關閉會直接縮匣，除非手動改設定
+            self.chk_minimize_to_tray.setChecked(True)
+            self.save_config()
+            self._hide_to_tray()
+            event.ignore()
+            return
+        # 對話框被 Esc / 右上角 X 關掉時，維持程式開啟
+        event.ignore()
 
 if __name__ == '__main__':
     try: is_admin = ctypes.windll.shell32.IsUserAnAdmin()
     except Exception: is_admin = False
-    
+
+    # 單一實例：已有程式在跑就帶到前景後結束，不開第二個
+    mutex_handle, already_running = single_instance.acquire_mutex()
+    if already_running:
+        single_instance.bring_existing_to_front()
+        sys.exit(0)
+
     app = QApplication(sys.argv)
+    # 全域預設圖示 (工作列/Alt-Tab 切換時顯示)
+    app.setWindowIcon(get_app_icon())
+
+    # Windows 工作列圖示分組：讓工作列顯示自訂 icon 而非 python 圖示
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "NetRedirector.GameProxyHub")
+    except Exception:
+        pass
+
     if not is_admin:
         QMessageBox.warning(None, tr.t("權限不足"), tr.t("請以管理員身分執行！"))
+        single_instance.release_mutex(mutex_handle)
         sys.exit(1)
 
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    single_instance.release_mutex(mutex_handle)
+    sys.exit(exit_code)

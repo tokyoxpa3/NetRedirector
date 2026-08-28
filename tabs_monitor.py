@@ -32,7 +32,13 @@ class MonitorTabMixin:
         self.tree_traffic = QTableWidget()
         self.tree_traffic.setColumnCount(len(cols))
         self._reg("headers", self.tree_traffic, cols)   # [i18n] 表頭也走語系檔
-        self.tree_traffic.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        # 短欄位依內容自動收合，Process(變動文字)才伸展；Info 為 Proxy(TCP) 等短文字
+        self.tree_traffic.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree_traffic.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tree_traffic.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree_traffic.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree_traffic.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree_traffic.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tree_traffic.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_traffic.customContextMenuRequested.connect(self.show_traffic_menu)
         layout.addWidget(self.tree_traffic)

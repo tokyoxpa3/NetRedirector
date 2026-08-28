@@ -45,3 +45,6 @@ config.json.corrupt.bak
 # Nuitka launcher byproducts (repo root)
 /IntegratedApp.exe
 /IntegratedApp.cmd
+
+# 關閉流程診斷計時檔 (IntegratedApp.py 關閉時寫入)
+/shutdown_timing.log
