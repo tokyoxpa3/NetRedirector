@@ -131,3 +131,29 @@ curl.exe --proxy socks5h://192.168.1.178:1080 https://api.ipify.org
 | `docs/images/4.png` | 4. Monitor | 即時流量與連線記錄 (Time/Dest) |
 | `docs/images/start.png` | 頂部控制列 | 啟動成功，狀態變更為「運行中」 |
 | `docs/images/stop.png` | 頂部控制列 | 停止服務，驅動解除攔截 |
+| `docs/images/5.png` | 5. VPN Gate | SoftEther 虛擬網卡列表、節點清單與篩選/派發按鈕 |
+
+---
+
+## 9. VPN Gate 節點派發（獨立功能教學）
+
+> 此分頁為 **v1.6** 新增功能，與前面 5G Proxy Pro 的流程互相獨立。它會抓取 [VPN Gate](https://www.vpngate.net/) 的公開中繼節點，並自動派發至 SoftEther 虛擬網卡，以「VPN 上網」的方式切換出口 IP。
+
+### 9.1 前置需求
+- 安裝 [SoftEther VPN Client](https://www.vpngate.net/cn/download.aspx)（`vpncmd.exe`，簡體中文版 v4.44）。
+- 透過 VPN Client Manager 建立至少一張虛擬網卡。
+
+### 9.2 操作步驟
+
+[VPN Gate 分頁畫面](docs/images/5.png)
+
+1. **重新整理網卡**：點擊「重新整理網卡」，上半部會列出所有 SoftEther 虛擬網卡，狀態欄以綠/紅顯示上線/離線。
+2. **抓取節點**：點擊「抓取節點」，從 VPN Gate 即時清單取得公開中繼節點，填入下方「VPN Gate 節點列表」。
+3. **設定篩選條件**（視需求）：
+   - **最低速度 (Mbps)**：排除速度低於門檻的節點（預設 10）。
+   - **排除 port 443** / **排除 public-\* 節點**：預設勾選。
+   - **所在地（多選，空=全部）**：只保留指定國家的節點。
+4. **套用篩選**：點擊後依條件過濾，並以 `(-score, ping)` 排序候選節點。
+5. **一鍵上線**：自動對所有**離線**網卡依序指派候選節點並連線；單一節點失敗會自動斷線改試下一個。
+
+> **注意**：抓取與連線皆在背景執行緒進行，進度請看左下角「系統日誌」。VPN Gate 為公開免費中繼，速度與穩定性不保證，連線失敗屬正常流程。

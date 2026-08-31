@@ -15,17 +15,22 @@
 
 ## 📸 介面預覽 (UI Gallery)
 
-> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下，並於下方表格中引用（目前使用 `1.png`、`2-1.png`、`2-2.png`、`3-1.png`、`3-2.png`、`4.png`；VPN Gate 分頁可新增 `5.png` 引用）。*
+> 💡 *提示：實際操作截圖置於專案的 `docs/images/` 目錄下，並於下方表格中引用（`1.png`、`2-1.png`、`3-1.png`、`4.png`、`5.png`）。*
 
 | 1. 端口路由管理 (Hub) | 2. 進程攔截規則 (Rules) |
 | :---: | :---: |
-| ![Hub 界面預覽](docs/images/1.png) | ![Rules 界面預覽](docs/images/2-1.png)<br>![Rules 界面預覽 2](docs/images/2-2.png) |
+| ![Hub 界面預覽](docs/images/1.png) | ![Rules 界面預覽](docs/images/2-1.png) |
 | *多本地監聽端口、網卡多對一綁定與即時延遲偵測* | *支援進程名稱/PID、多條件過濾與代理綁定* |
 
 | 3. 自訂代理管理 (Proxies) | 4. 即時流量監控 (Monitor) |
 | :---: | :---: |
-| ![Proxies 界面預覽](docs/images/3-1.png)<br>![Proxies 界面預覽 2](docs/images/3-2.png) | ![Monitor 界面預覽](docs/images/4.png) |
+| ![Proxies 界面預覽](docs/images/3-1.png) | ![Monitor 界面預覽](docs/images/4.png) |
 | *SOCKS5 / HTTP 代理設定與一鍵可用性 Ping 測試* | *即時封包記錄、進程資訊與右鍵快速建立規則* |
+
+| 5. VPN Gate 節點派發 (VPN Gate) |
+| :---: |
+| [VPN Gate 界面預覽](docs/images/5.png) |
+| *SoftEther 虛擬網卡管理、VPN Gate 公開節點抓取與一鍵派發連線* |
 
 ---
 
@@ -178,10 +183,9 @@ NetRedirector/
 │   └── images/              # UI 截圖目錄
 │       ├── 1.png            # Hub 分頁截圖
 │       ├── 2-1.png          # Rules 分頁截圖
-│       ├── 2-2.png          # Rules 分頁截圖
 │       ├── 3-1.png          # Proxies 分頁截圖
-│       ├── 3-2.png          # Proxies 分頁截圖
-│       └── 4.png            # Monitor 分頁截圖
+│       ├── 4.png            # Monitor 分頁截圖
+│       └── 5.png            # VPN Gate 分頁截圖
 └── NetRedirector/           # C 語言底層原始碼與編譯腳本
     ├── NetRedirector.c      # DLL 導出 API 與生命週期管理
     ├── NR_Core.c            # WinDivert 封包過濾與 UDP Relay
