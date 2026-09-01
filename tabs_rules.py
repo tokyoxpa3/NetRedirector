@@ -52,11 +52,11 @@ class RulesTabMixin:
         
         row2 = QHBoxLayout()
         self.ent_hosts = QLineEdit()
-        self._reg("placeholder", self.ent_hosts, "IP (預設 *)")
+        self._reg("placeholder", self.ent_hosts, "IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*")
         self.ent_hosts.setText("*")
         self.ent_hosts.setFixedWidth(280)
         self.ent_ports = QLineEdit()
-        self._reg("placeholder", self.ent_ports, "Port (預設 *)")
+        self._reg("placeholder", self.ent_ports, "Port (預設 *) 例: 443;1000-2000")
         self.ent_ports.setText("*")
         self.ent_ports.setFixedWidth(100)
         self.combo_proto = QComboBox()
