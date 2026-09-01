@@ -564,14 +564,14 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     snprintf(filter, sizeof(filter),
         "(ip and ("
         "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
-        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d)"
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
         " and udp.DstPort != 67 and udp.SrcPort != 67"
         " and udp.DstPort != 68 and udp.SrcPort != 68))"
         " and (inbound or ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255))"
         " or "
         "(ipv6 and ("
         "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
-        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d)"
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
         " and udp.DstPort != 67 and udp.SrcPort != 67"
         " and udp.DstPort != 68 and udp.SrcPort != 68))"
         " and (inbound or ipv6.DstAddr != ::1))",
@@ -681,6 +681,7 @@ fail:
     clear_udp_associations();
     clear_pid_cache();
     clear_dns_cache();
+    clear_dns_snoop_cache();
     return FALSE;
 }
 
@@ -740,6 +741,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Stop(void)
     clear_udp_associations(); // Clean sockets
     clear_pid_cache();        // Drop stale PID/process-name cache entries
     clear_dns_cache();        // [Added] Drop stale domain-rule DNS resolution cache
+    clear_dns_snoop_cache();  // [Added] Drop stale DNS-snoop IP->domain cache
 
     log_message("NetRedirector stopped");
     return TRUE;

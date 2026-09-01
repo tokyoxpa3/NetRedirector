@@ -48,12 +48,14 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
     PWINDIVERT_IPV6HDR ipv6_header;
     PWINDIVERT_TCPHDR tcp_header;
     PWINDIVERT_UDPHDR udp_header;
+    PVOID udp_payload;
+    UINT udp_payload_len;
     UINT8 *src_addr;
     UINT8 *dst_addr;
     int family;
 
     WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL, NULL, NULL,
-        &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+        &tcp_header, &udp_header, &udp_payload, &udp_payload_len, NULL, NULL);
 
     if (ip_header != NULL) {
         family = AF_INET;
@@ -116,6 +118,14 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                 }
             }
         } else {
+            // DNS snooping: observe inbound plaintext DNS responses (UDP
+            // source port 53) to feed the IP->domain reverse map behind
+            // wildcard-subdomain rules. Observation only — the packet is still
+            // passed through unchanged below. The parser rejects non-response
+            // or malformed payloads cheaply.
+            if (udp_header->SrcPort == htons(53)) {
+                dns_snoop_parse_response((const UINT8*)udp_payload, udp_payload_len);
+            }
             if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT)) {
                 send_packet_checked(packet, packet_len, addr, "udp passthrough");
                 return;

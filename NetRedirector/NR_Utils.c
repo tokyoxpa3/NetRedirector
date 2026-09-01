@@ -158,6 +158,37 @@ UINT32 resolve_hostname(const char *hostname)
     return resolved_ip;
 }
 
+// [Added] IPv6 hostname resolution (mirror of resolve_hostname for AF_INET6).
+// Returns TRUE and writes 16 bytes (network byte order) into out_addr6 on
+// success. getaddrinfo() with AF_INET6 also parses literal IPv6 addresses, so
+// no separate literal-parse step is needed (unlike the IPv4 dotted-quad case).
+BOOL resolve_hostname6(const char *hostname, UINT8 *out_addr6)
+{
+    if (hostname == NULL || hostname[0] == '\0' || out_addr6 == NULL)
+        return FALSE;
+
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET6;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, NULL, &hints, &result) != 0) {
+        return FALSE;
+    }
+
+    BOOL ok = FALSE;
+    for (struct addrinfo *p = result; p != NULL; p = p->ai_next) {
+        if (p->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sa = (struct sockaddr_in6 *)p->ai_addr;
+            memcpy(out_addr6, &sa->sin6_addr, 16);
+            ok = TRUE;
+            break;
+        }
+    }
+    freeaddrinfo(result);
+    return ok;
+}
+
 // === DNS Resolution Cache (for domain-name rules) ===
 //
 // Hosts field now supports domain names ("google.com" / "*.google.com"). The
@@ -183,6 +214,20 @@ typedef struct {
 
 static DNS_CACHE_ENTRY g_dns_cache[DNS_CACHE_SIZE];
 static UINT32 g_dns_cache_next_slot = 0;   // round-robin replacement
+
+// IPv6 flavor of the rule-DNS cache (parallel to the IPv4 cache above). Same
+// TTL and slot-reuse policy. `valid == FALSE` records a cached failure (a
+// domain with no AAAA record), so an unresolvable domain does not hammer the
+// resolver — mirroring the IPv4 "ip == 0" convention.
+typedef struct {
+    DWORD timestamp;
+    char domain[256];
+    UINT8 addr[16];   // resolved IPv6 (network byte order); meaningful when valid
+    BOOL valid;       // FALSE = cached failure (domain set but no AAAA)
+} DNS_CACHE_ENTRY6;
+
+static DNS_CACHE_ENTRY6 g_dns_cache6[DNS_CACHE_SIZE];
+static UINT32 g_dns_cache6_next_slot = 0;   // round-robin replacement
 
 UINT32 resolve_rule_host(const char *host)
 {
@@ -272,11 +317,345 @@ void force_resolve_rule_host(const char *host)
     LeaveCriticalSection(&lock_pid_cache);
 }
 
+// IPv6 cache-only lookup for the packet-thread match path (mirror of
+// resolve_rule_host_cached). Never calls getaddrinfo — a cache miss returns
+// FALSE (the background refresher fills the cache shortly after a rule is
+// added/edited). A cached failure also returns FALSE.
+BOOL resolve_rule_host_cached6(const char *host, UINT8 *out_addr6)
+{
+    if (host == NULL || host[0] == '\0' || out_addr6 == NULL) return FALSE;
+
+    EnterCriticalSection(&lock_pid_cache);
+    for (UINT32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        DNS_CACHE_ENTRY6 *e = &g_dns_cache6[i];
+        if (e->domain[0] == '\0') continue;
+        if (strcmp(e->domain, host) != 0) continue;
+        BOOL ok = e->valid;
+        if (ok) memcpy(out_addr6, e->addr, 16);
+        LeaveCriticalSection(&lock_pid_cache);
+        return ok;
+    }
+    LeaveCriticalSection(&lock_pid_cache);
+    return FALSE;
+}
+
+// IPv6 unconditional resolve + store for the background refresher (mirror of
+// force_resolve_rule_host).
+void force_resolve_rule_host6(const char *host)
+{
+    if (host == NULL || host[0] == '\0') return;
+
+    UINT8 addr[16];
+    BOOL valid = resolve_hostname6(host, addr);
+
+    EnterCriticalSection(&lock_pid_cache);
+    DNS_CACHE_ENTRY6 *slot = NULL;
+    for (UINT32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        if (g_dns_cache6[i].domain[0] != '\0' && strcmp(g_dns_cache6[i].domain, host) == 0) {
+            slot = &g_dns_cache6[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        slot = &g_dns_cache6[g_dns_cache6_next_slot++ % DNS_CACHE_SIZE];
+        strncpy(slot->domain, host, sizeof(slot->domain) - 1);
+        slot->domain[sizeof(slot->domain) - 1] = '\0';
+    }
+    slot->timestamp = GetTickCount();
+    slot->valid = valid;
+    if (valid) memcpy(slot->addr, addr, 16);
+    LeaveCriticalSection(&lock_pid_cache);
+}
+
 void clear_dns_cache(void)
 {
     EnterCriticalSection(&lock_pid_cache);
     memset(g_dns_cache, 0, sizeof(g_dns_cache));
     g_dns_cache_next_slot = 0;
+    memset(g_dns_cache6, 0, sizeof(g_dns_cache6));
+    g_dns_cache6_next_slot = 0;
+    LeaveCriticalSection(&lock_pid_cache);
+}
+
+// === DNS Snooping: IP -> domain reverse map ===
+//
+// Wildcard domain rules ("*.google.com") must match ANY subdomain, but the
+// packet engine only ever sees the destination IP. This cache reverse-maps an
+// IP to the domain names that recently resolved to it, by passively observing
+// plaintext DNS responses (UDP source port 53) on the wire.
+//
+// Populated on the packet path (DNS responses are low-frequency) and read on
+// the new-connection match path (cold path, never per-packet). A fixed TTL is
+// used (v1 does not parse the per-record DNS TTL); expired entries fall back
+// to the apex-resolve path in match_ip_pattern. Guarded by lock_pid_cache,
+// same as the rule-DNS cache above (both acquisitions are short).
+//
+// Limitation: only plaintext DNS is observable. DoH/DoT (443/853) and DNS that
+// is itself routed through a proxy are invisible here, so wildcard-subdomain
+// rules then degrade to apex-only matching.
+
+#define DNS_SNOOP_CACHE_SIZE 512
+#define DNS_SNOOP_TTL_MS 600000   // 10 minutes
+#define DNS_SNOOP_MAX_DOMAINS 4   // per-IP domain list cap (CDN IP sharing)
+
+typedef struct {
+    DWORD timestamp;
+    int family;               // AF_INET or AF_INET6
+    UINT8 addr[16];           // network byte order (IPv4 uses first 4 bytes)
+    char domains[DNS_SNOOP_MAX_DOMAINS][256];
+    int domain_count;
+} DNS_SNOOP_ENTRY;
+
+static DNS_SNOOP_ENTRY g_dns_snoop_cache[DNS_SNOOP_CACHE_SIZE];
+static UINT32 g_dns_snoop_next_slot = 0;
+
+// Maximum compression-pointer hops before declaring a name malformed
+// (defends against pointer loops in hostile/malformed packets).
+#define DNS_MAX_POINTER_HOPS 16
+
+// Decode a DNS name starting at message offset `off`, following compression
+// pointers. Writes the dotted form into `out` (bounded, NULL-terminated).
+// Returns TRUE on success. Does not touch the caller's position.
+static BOOL dns_decode_name(const UINT8 *msg, UINT msg_len, UINT off, char *out, UINT out_len)
+{
+    UINT hops = 0;
+    UINT pos = off;
+    UINT out_pos = 0;
+    BOOL first = TRUE;
+
+    if (out == NULL || out_len == 0) return FALSE;
+    out[0] = '\0';
+
+    while (hops < DNS_MAX_POINTER_HOPS) {
+        if (pos >= msg_len) return FALSE;
+        UINT8 len = msg[pos];
+
+        if ((len & 0xC0) == 0xC0) {
+            // Compression pointer: two bytes, target is an offset from msg[0].
+            if (pos + 1 >= msg_len) return FALSE;
+            UINT target = ((UINT)(len & 0x3F) << 8) | msg[pos + 1];
+            if (target >= msg_len) return FALSE;
+            pos = target;
+            hops++;
+            continue;
+        }
+        if ((len & 0xC0) != 0) return FALSE;  // reserved label type (0x40/0x80)
+
+        pos++;                       // move past the length byte
+        if (len == 0) break;         // root label: end of name
+
+        if (pos + len > msg_len) return FALSE;
+
+        if (!first) {
+            if (out_pos + 1 >= out_len) return FALSE;
+            out[out_pos++] = '.';
+        }
+        first = FALSE;
+
+        if (out_pos + len >= out_len) return FALSE;
+        memcpy(out + out_pos, msg + pos, len);
+        out_pos += len;
+        pos += len;
+    }
+
+    if (hops >= DNS_MAX_POINTER_HOPS) return FALSE;
+    out[out_pos] = '\0';
+    return TRUE;
+}
+
+// Advance *pos past a DNS name in the message. A compression pointer advances
+// by exactly 2 bytes (it terminates the name at the pointer site). Used to
+// skip question/answer names without decoding them.
+static BOOL dns_skip_name(const UINT8 *msg, UINT msg_len, UINT *pos)
+{
+    while (*pos < msg_len) {
+        UINT8 len = msg[*pos];
+        if ((len & 0xC0) == 0xC0) {
+            if (*pos + 1 >= msg_len) return FALSE;
+            *pos += 2;
+            return TRUE;
+        }
+        if ((len & 0xC0) != 0) return FALSE;
+        (*pos)++;
+        if (len == 0) return TRUE;
+        if (*pos + len > msg_len) return FALSE;
+        *pos += len;
+    }
+    return FALSE;
+}
+
+// Record one address -> domain mapping (append to an existing entry, else a
+// fresh round-robin slot). No-ops on empty domain. The entry is keyed by
+// (family, addr), so the same cache serves IPv4 A records and IPv6 AAAA records.
+static void dns_snoop_record_addr(int family, const UINT8 *addr, const char *domain)
+{
+    if (domain == NULL || domain[0] == '\0' || addr == NULL) return;
+
+    int addr_len = (family == AF_INET) ? 4 : 16;
+    DWORD now = GetTickCount();
+    EnterCriticalSection(&lock_pid_cache);
+
+    for (UINT32 i = 0; i < DNS_SNOOP_CACHE_SIZE; i++) {
+        DNS_SNOOP_ENTRY *e = &g_dns_snoop_cache[i];
+        if (e->family != family) continue;
+        if (memcmp(e->addr, addr, addr_len) != 0) continue;
+
+        // Dedup, then append if there is room.
+        int d;
+        for (d = 0; d < e->domain_count; d++) {
+            if (strcmp(e->domains[d], domain) == 0) break;
+        }
+        if (d == e->domain_count && e->domain_count < DNS_SNOOP_MAX_DOMAINS) {
+            strncpy(e->domains[e->domain_count], domain, sizeof(e->domains[0]) - 1);
+            e->domains[e->domain_count][sizeof(e->domains[0]) - 1] = '\0';
+            e->domain_count++;
+        }
+        e->timestamp = now;
+        LeaveCriticalSection(&lock_pid_cache);
+        return;
+    }
+
+    DNS_SNOOP_ENTRY *slot = &g_dns_snoop_cache[g_dns_snoop_next_slot++ % DNS_SNOOP_CACHE_SIZE];
+    memset(slot, 0, sizeof(*slot));
+    slot->family = family;
+    memcpy(slot->addr, addr, addr_len);
+    slot->timestamp = now;
+    slot->domain_count = 1;
+    strncpy(slot->domains[0], domain, sizeof(slot->domains[0]) - 1);
+    slot->domains[0][sizeof(slot->domains[0]) - 1] = '\0';
+
+    LeaveCriticalSection(&lock_pid_cache);
+}
+
+// IPv4 wrapper (A record): the UINT32 is in network byte order, matching
+// parse_ipv4 / *(UINT32*)dest_addr.
+void dns_snoop_record(UINT32 ip, const char *domain)
+{
+    if (ip == 0) return;
+    UINT8 a[16];
+    memset(a, 0, sizeof(a));
+    memcpy(a, &ip, 4);
+    dns_snoop_record_addr(AF_INET, a, domain);
+}
+
+// IPv6 wrapper (AAAA record).
+void dns_snoop_record6(const UINT8 *addr6, const char *domain)
+{
+    dns_snoop_record_addr(AF_INET6, addr6, domain);
+}
+
+// Query the snoop cache: does the address map to a domain equal to `suffix` or
+// ending in ".suffix"? Cache-only and bounded — safe on the packet thread.
+static BOOL dns_snoop_matches_suffix_addr(int family, const UINT8 *addr, const char *suffix)
+{
+    if (suffix == NULL || suffix[0] == '\0' || addr == NULL) return FALSE;
+
+    int addr_len = (family == AF_INET) ? 4 : 16;
+    size_t suffix_len = strlen(suffix);
+    DWORD now = GetTickCount();
+
+    EnterCriticalSection(&lock_pid_cache);
+    for (UINT32 i = 0; i < DNS_SNOOP_CACHE_SIZE; i++) {
+        DNS_SNOOP_ENTRY *e = &g_dns_snoop_cache[i];
+        if (e->family != family) continue;
+        if (memcmp(e->addr, addr, addr_len) != 0) continue;
+        if ((now - e->timestamp) > DNS_SNOOP_TTL_MS) continue;  // expired
+
+        for (int d = 0; d < e->domain_count; d++) {
+            const char *dom = e->domains[d];
+            size_t dom_len = strlen(dom);
+            if (dom_len == suffix_len && _stricmp(dom, suffix) == 0) {
+                LeaveCriticalSection(&lock_pid_cache);
+                return TRUE;
+            }
+            if (dom_len > suffix_len && dom[dom_len - suffix_len - 1] == '.' &&
+                _stricmp(dom + dom_len - suffix_len, suffix) == 0) {
+                LeaveCriticalSection(&lock_pid_cache);
+                return TRUE;
+            }
+        }
+        break;  // at most one entry per (family, addr)
+    }
+    LeaveCriticalSection(&lock_pid_cache);
+    return FALSE;
+}
+
+// IPv4 wrapper.
+BOOL dns_snoop_matches_suffix(UINT32 ip, const char *suffix)
+{
+    UINT8 a[16];
+    memset(a, 0, sizeof(a));
+    memcpy(a, &ip, 4);
+    return dns_snoop_matches_suffix_addr(AF_INET, a, suffix);
+}
+
+// IPv6 wrapper.
+BOOL dns_snoop_matches_suffix6(const UINT8 *addr6, const char *suffix)
+{
+    return dns_snoop_matches_suffix_addr(AF_INET6, addr6, suffix);
+}
+
+// Parse a plaintext DNS response message and record every A record's IP under
+// the question name. Returns the number of A records processed, or -1 if the
+// message is not a parseable DNS response (or not a response at all).
+int dns_snoop_parse_response(const UINT8 *msg, UINT msg_len)
+{
+    if (msg == NULL || msg_len < 12) return -1;
+
+    UINT16 flags = ((UINT16)msg[2] << 8) | msg[3];
+    BOOL is_response = (flags & 0x8000) != 0;
+    UINT16 qdcount = ((UINT16)msg[4] << 8) | msg[5];
+    UINT16 ancount = ((UINT16)msg[6] << 8) | msg[7];
+
+    if (!is_response || qdcount == 0) return -1;
+
+    // Decode the first question name (the domain the app was resolving).
+    char domain[256];
+    if (!dns_decode_name(msg, msg_len, 12, domain, sizeof(domain))) return -1;
+
+    // Skip the question section: QNAME(s) + QTYPE(2) + QCLASS(2) each.
+    UINT pos = 12;
+    UINT16 q;
+    for (q = 0; q < qdcount; q++) {
+        if (!dns_skip_name(msg, msg_len, &pos)) return -1;
+        pos += 4;
+    }
+
+    int recorded = 0;
+    UINT16 a;
+    for (a = 0; a < ancount; a++) {
+        if (!dns_skip_name(msg, msg_len, &pos)) return -1;   // answer NAME
+        if (pos + 10 > msg_len) return -1;                   // TYPE+CLASS+TTL+RDLENGTH
+        UINT16 type = ((UINT16)msg[pos] << 8) | msg[pos + 1];
+        UINT16 rdlength = ((UINT16)msg[pos + 8] << 8) | msg[pos + 9];
+        pos += 10;
+        if (pos + rdlength > msg_len) return -1;
+
+        if (type == 1 && rdlength == 4) {
+            // A record: 4-byte IPv4 in network byte order. Read as a UINT32 so
+            // the stored value matches the packet-engine convention used by
+            // parse_ipv4 / *(UINT32*)dest_addr (e.g. 1.2.3.4 -> 0x04030201).
+            UINT32 ip;
+            memcpy(&ip, msg + pos, 4);
+            dns_snoop_record(ip, domain);
+            recorded++;
+        }
+        else if (type == 28 && rdlength == 16) {
+            // AAAA record: 16-byte IPv6 in network byte order.
+            dns_snoop_record6(msg + pos, domain);
+            recorded++;
+        }
+        pos += rdlength;
+    }
+    return recorded;
+}
+
+// Clear the DNS snoop cache (called on Stop alongside clear_dns_cache).
+void clear_dns_snoop_cache(void)
+{
+    EnterCriticalSection(&lock_pid_cache);
+    memset(g_dns_snoop_cache, 0, sizeof(g_dns_snoop_cache));
+    g_dns_snoop_next_slot = 0;
     LeaveCriticalSection(&lock_pid_cache);
 }
 
@@ -299,7 +678,10 @@ void refresh_rule_dns(const char *hosts_field)
         while (*token == ' ' || *token == '\t') token++;
         if (token[0] != '\0' && !is_wildcard_str(token) && !is_ip_like_pattern(token)) {
             if (token[0] == '*' && token[1] == '.') token += 2;
-            if (token[0] != '\0') force_resolve_rule_host(token);
+            if (token[0] != '\0') {
+                force_resolve_rule_host(token);
+                force_resolve_rule_host6(token);
+            }
         }
         token = strtok(NULL, ";");
     }
@@ -629,6 +1011,27 @@ BOOL is_lan_or_on_link_address(int family, const UINT8 *addr)
 BOOL match_ip_pattern6(const char *pattern, const UINT8 *ip)
 {
     if (is_wildcard_str(pattern)) return TRUE;
+
+    // A domain rule never contains ':' (IPv6 literals always do).
+    if (strchr(pattern, ':') == NULL) {
+        BOOL is_subdomain_wildcard = (pattern[0] == '*' && pattern[1] == '.');
+        const char *host = is_subdomain_wildcard ? pattern + 2 : pattern;
+
+        // Wildcard subdomain: DNS-snoop reverse map first.
+        if (is_subdomain_wildcard && dns_snoop_matches_suffix6(ip, host)) {
+            return TRUE;
+        }
+
+        // Apex-resolution fallback (bare domain, and wildcard when the snoop
+        // cache misses): compare against the IPv6 address resolved for `host`.
+        UINT8 resolved[16];
+        if (resolve_rule_host_cached6(host, resolved) &&
+            memcmp(resolved, ip, 16) == 0) {
+            return TRUE;
+        }
+        return FALSE;
+    }
+
     char addr_str[MAX_IP_STR];
     addr_to_string(AF_INET6, ip, addr_str, sizeof(addr_str));
     return _stricmp(pattern, addr_str) == 0;
@@ -732,8 +1135,16 @@ BOOL match_ip_pattern(const char *pattern, UINT32 ip) {
     // -> no match; the background refresher fills the cache shortly after a
     // rule is added/edited.
     if (!is_ip_like_pattern(pattern)) {
-        const char *host = pattern;
-        if (host[0] == '*' && host[1] == '.') host += 2;   // strip ".*" prefix
+        // Domain rule. A leading "*." means "any subdomain": consult the
+        // DNS-snoop reverse map first (with the apex-resolution path kept as
+        // the fallback, and the sole path for bare domains).
+        BOOL is_subdomain_wildcard = (pattern[0] == '*' && pattern[1] == '.');
+        const char *host = is_subdomain_wildcard ? pattern + 2 : pattern;
+
+        if (is_subdomain_wildcard && dns_snoop_matches_suffix(ip, host)) {
+            return TRUE;
+        }
+
         UINT32 resolved = resolve_rule_host_cached(host);
         return (resolved != 0 && resolved == ip);
     }
