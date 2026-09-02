@@ -27,11 +27,16 @@
 .PARAMETER NoDll
     跳過 DLL 編譯 (僅執行 Nuitka 打包，需已有編譯好的 DLL)。
 
+.PARAMETER Force
+    打包前若 IntegratedApp.exe 正在執行，強制結束程序並停止 WinDivert 服務
+    （跳過優雅關閉，未儲存的設定變更會遺失）。預設不強制，會要求手動關閉。
+
 .EXAMPLE
     .\build.ps1                        # 僅編譯 DLL
     .\build.ps1 -Standalone            # 編譯 DLL + 打包 standalone
     .\build.ps1 -Onefile -ConsoleMode  # 編譯 DLL + 打包單一 exe (含主控台)
     .\build.ps1 -Standalone -NoDll     # 僅打包 (跳過 DLL 編譯)
+    .\build.ps1 -Standalone -Force     # 打包 (自動強制關閉執行中的應用程式)
 #>
 
 param(
@@ -40,7 +45,8 @@ param(
     [switch]$Onefile,
     [string]$EntryPoint = "IntegratedApp.py",
     [switch]$ConsoleMode,
-    [switch]$NoDll
+    [switch]$NoDll,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -151,24 +157,30 @@ Write-Host "=== Nuitka 打包 ===" -ForegroundColor Cyan
 
 # [Added] 殘留的 WinDivert 驅動服務會鎖住 .sys/.dll 檔 (核心載入中無法覆寫),
 # 導致 Nuitka 複製執行期檔案時 PermissionError。應用程式沒在跑時自動停掉;
-# 停不掉或應用程式在跑, 給出明確指示後中止。
+# 應用程式在跑時：預設中止並提示手動關閉，加 -Force 則自動強制結束再打包。
 $wdSvc = Get-Service -Name "WinDivert" -ErrorAction SilentlyContinue
 if ($wdSvc -and $wdSvc.Status -eq "Running") {
     $appProc = Get-Process -Name "IntegratedApp" -ErrorAction SilentlyContinue
-    if (-not $appProc) {
-        Write-Host "  偵測到殘留的 WinDivert 驅動服務 (執行中), 嘗試停止..." -ForegroundColor Yellow
-        & sc.exe stop WinDivert | Out-Null
-        Start-Sleep -Seconds 2
-        $wdSvc.Refresh()
-        if ($wdSvc.Status -eq "Running") {
-            Write-Error "無法停止 WinDivert 驅動服務, .sys 被鎖定無法打包。請以管理員執行: sc.exe stop WinDivert 後重試。"
+    if ($appProc) {
+        if (-not $Force) {
+            Write-Error "NetRedirector 應用程式執行中 (IntegratedApp.exe), 驅動檔案被鎖定。請先關閉應用程式再打包（或加 -Force 自動強制關閉）。"
             exit 1
         }
-        Write-Host "  驅動服務已停止。" -ForegroundColor Gray
-    } else {
-        Write-Error "NetRedirector 應用程式執行中 (IntegratedApp.exe), 驅動檔案被鎖定。請先關閉應用程式再打包。"
+        Write-Host "  -Force：強制結束 IntegratedApp.exe (跳過優雅關閉，未儲存的設定變更會遺失)..." -ForegroundColor Yellow
+        $appProc | Stop-Process -Force
+        Start-Sleep -Seconds 2
+    }
+
+    # 停止 WinDivert 驅動服務，釋放被鎖定的 .sys/.dll 檔
+    Write-Host "  偵測到 WinDivert 驅動服務 (執行中), 嘗試停止..." -ForegroundColor Yellow
+    & sc.exe stop WinDivert | Out-Null
+    Start-Sleep -Seconds 2
+    $wdSvc.Refresh()
+    if ($wdSvc.Status -eq "Running") {
+        Write-Error "無法停止 WinDivert 驅動服務, .sys 被鎖定無法打包。請以管理員執行: sc.exe stop WinDivert 後重試。"
         exit 1
     }
+    Write-Host "  驅動服務已停止。" -ForegroundColor Gray
 }
 
 # 確認入口腳本存在
