@@ -145,11 +145,23 @@ class NetRedirectorWrapper:
             proxy_id
         )
 
-    def set_connection_callback(self, python_func):
+    def set_connection_callback(self, python_func, throttle_ms=200):
         """
         python_func(process_name, pid, dest_ip, dest_port, proxy_info)
+
+        throttle_ms: 連線回呼的轉送間隔（毫秒）。此回呼在 C 的封包處理緒上同步
+        執行，BT 等高併發情境每秒可觸發數百次；每轉送一次都要跨進 Python 拿 GIL
+        並 emit Qt 訊號，會拖慢封包轉發、卡住整個轉發器。限流後封包緒幾乎立即
+        返回，GUI 只收到每 throttle_ms 最多一次的更新（流量監看綽綽有餘）。
         """
+        interval = max(0.0, float(throttle_ms)) / 1000.0
+        state = {'last': 0.0}
+
         def c_callback(proc_ptr, pid, ip_ptr, port, info_ptr):
+            now = time.monotonic()
+            if interval > 0 and now - state['last'] < interval:
+                return  # 限流：高併發下不逐條跨 GIL / emit
+            state['last'] = now
             proc = proc_ptr.decode('utf-8', errors='ignore') if proc_ptr else "Unknown"
             ip = ip_ptr.decode('utf-8', errors='ignore') if ip_ptr else "0.0.0.0"
             info = info_ptr.decode('utf-8', errors='ignore') if info_ptr else ""

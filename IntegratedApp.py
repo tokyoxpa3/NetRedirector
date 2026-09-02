@@ -480,7 +480,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.tree_traffic.setItem(row, 2, QTableWidgetItem(str(pid)))
         self.tree_traffic.setItem(row, 3, QTableWidgetItem(f"{ip}:{port}"))
         self.tree_traffic.setItem(row, 4, QTableWidgetItem(info))
-        self.tree_traffic.scrollToBottom()
+        # 不再逐列 scrollToBottom()：那是 BT 高併發下最貴的一行（強制視圖重算）。
+        # 連線回呼已在 NetRedirector.set_connection_callback 限流（預設 5 次/秒），
+        # 這裡保持輕量即可避免 GUI flood。
 
     def on_dll_log(self, msg):
         self.append_log(f"[DLL] {msg}")
