@@ -60,3 +60,17 @@ def test_is_frozen_detects_nuitka_compiled(monkeypatch):
     monkeypatch.setattr(updater, "__compiled__", False, raising=False)
     assert updater.is_frozen() is False
 
+
+def test_frozen_exe_path_prefers_argv_exe(monkeypatch):
+    """Nuitka 把 sys.executable 指到 python.exe，真正的 exe 在 sys.argv[0]。"""
+    monkeypatch.setattr(updater.sys, "argv", [r"C:\app\IntegratedApp.exe"])
+    monkeypatch.setattr(updater.sys, "executable", r"C:\app\python.exe")
+    assert updater._frozen_exe_path().lower().endswith("integratedapp.exe")
+
+
+def test_frozen_exe_path_falls_back_to_executable(monkeypatch):
+    """argv 無法提供 .exe 時回退到 sys.executable。"""
+    monkeypatch.setattr(updater.sys, "argv", [""])
+    monkeypatch.setattr(updater.sys, "executable", r"C:\app\IntegratedApp.exe")
+    assert updater._frozen_exe_path().lower().endswith("integratedapp.exe")
+

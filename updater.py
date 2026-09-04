@@ -125,10 +125,26 @@ def is_frozen():
     return False
 
 
+
+
+def _frozen_exe_path():
+    """取得打包後真正的執行檔路徑。
+
+    Nuitka standalone 會把 ``sys.executable`` 指到內建的 ``python.exe``
+    (而非真正的 IntegratedApp.exe)，導致 exe 名稱被誤判為 "python"、
+    替換腳本等錯程序。故以 ``sys.argv[0]`` 為準，失敗時回退 ``sys.executable``。
+    """
+    argv0 = sys.argv[0] if sys.argv else ""
+    p = os.path.abspath(argv0) if argv0 else ""
+    if p and p.lower().endswith(".exe"):
+        return p
+    return os.path.abspath(sys.executable)
+
+
 def current_dist_dir():
     """目前執行檔所在資料夾 (打包後即 .dist 目錄)。"""
     if is_frozen():
-        return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(_frozen_exe_path())
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -262,7 +278,7 @@ def apply_and_restart():
         raise RuntimeError("自動更新的套用/替換步驟僅支援打包後的可執行檔（目前偵測為原始碼/開發模式執行）")
 
     dist_dir = current_dist_dir()
-    exe_path = sys.executable
+    exe_path = _frozen_exe_path()
     exe_base = os.path.basename(exe_path)          # 例如 IntegratedApp.exe
     exe_name = os.path.splitext(exe_base)[0]       # Get-Process 需去掉 .exe
     new_dir = dist_dir + ".new"
