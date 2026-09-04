@@ -78,8 +78,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     def __init__(self):
         super().__init__()
         self._i18n_registry = []
-        self.setWindowTitle(self.t("NetRedirector x GameProxyHub 整合專業版"))
-        self._reg("window", self, "NetRedirector x GameProxyHub 整合專業版")
+        self._set_window_title()
         self.resize(1024, 768)
 
         # 應用程式圖示 (工作列/視窗/tray 共用)
@@ -179,6 +178,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     def t(self, s):
         return tr.t(s)
 
+    def _set_window_title(self):
+        self.setWindowTitle(f"{self.t('NetRedirector x GameProxyHub 整合專業版')} v{APP_VERSION}")
+
     def _reg(self, kind, *args):
         self._i18n_registry.append((kind, args))
         self._apply_i18n(kind, args)
@@ -210,6 +212,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     def retranslate_ui(self):
         for kind, args in self._i18n_registry:
             self._apply_i18n(kind, args)
+        self._set_window_title()
         self.update_service_status()
         self.update_hub_status()
         self.update_form_titles()

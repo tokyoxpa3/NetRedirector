@@ -194,6 +194,9 @@ def _apply_script_content():
 )
 $ErrorActionPreference = 'SilentlyContinue'
 
+# 需跨版本保留的執行期資料 (設定檔、VPN 節點歷史)
+$runtimeFiles = @('config.json', 'vpn_history.json')
+
 # 1. 等主程式完全退出 (程式檔名不含 .exe)
 while (Get-Process -Name $ExeName -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 1
@@ -214,9 +217,23 @@ for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
     if (Test-Path $Exe) { $ok = $true } else { Start-Sleep -Seconds 1 }
 }
 
-# 4. 重新啟動
+# 3.5 保留執行期資料:從舊版搬回新版,避免更新後設定被清零
+foreach ($f in $runtimeFiles) {
+    $src = Join-Path $OldDir $f
+    if ((Test-Path $src) -and (Test-Path $Dist)) {
+        Copy-Item $src (Join-Path $Dist $f) -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 4. 重新啟動 (失敗寫入 %TEMP% 日誌供偵錯)
 if ($ok) {
-    Start-Process -FilePath $Exe -WorkingDirectory (Split-Path $Exe)
+    $logPath = Join-Path $env:TEMP 'NetRedirector_update.log'
+    try {
+        Start-Process -FilePath $Exe -WorkingDirectory $Dist -ErrorAction Stop
+        Add-Content -Path $logPath -Value "RESTART OK  $([DateTime]::Now.ToString('o'))"
+    } catch {
+        Add-Content -Path $logPath -Value "RESTART FAIL  $([DateTime]::Now.ToString('o'))  $_"
+    }
 }
 
 # 5. 背景清除舊版本 (不阻塞新程式啟動)
