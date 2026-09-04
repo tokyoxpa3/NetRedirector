@@ -74,3 +74,11 @@ def test_frozen_exe_path_falls_back_to_executable(monkeypatch):
     monkeypatch.setattr(updater.sys, "executable", r"C:\app\IntegratedApp.exe")
     assert updater._frozen_exe_path().lower().endswith("integratedapp.exe")
 
+
+def test_apply_script_relaunch_uses_processstartinfo():
+    """PS 5.1 的 Start-Process 沒有 -UseShellExecute 參數，重啟必須走 .NET ProcessStartInfo。"""
+    script = updater._apply_script_content()
+    assert "-UseShellExecute" not in script   # 防止誤用不存在的參數
+    assert "System.Diagnostics.ProcessStartInfo" in script
+    assert "$psi.UseShellExecute = $false" in script
+

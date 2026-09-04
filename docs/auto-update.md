@@ -120,7 +120,7 @@ def stage_update(url, name, checksum_url):
 1. 等主程式程序真的退出（`Get-Process -Name <exe名>`）。
 2. 交換：`dist` → `dist.old`、`dist.new` → `dist`（帶重試，處理檔案解鎖延遲）。
 3. **把執行期資料從 `dist.old` 搬回 `dist`**（`config.json`、歷史檔等）——不做這步設定就會被清零。
-4. `Start-Process -UseShellExecute $false` 重啟。
+4. 用 .NET `ProcessStartInfo`（`UseShellExecute = $false`，走 CreateProcess）重啟。
 5. 清理 `dist.old`（同步重試）。
 
 ---
@@ -163,15 +163,21 @@ def _frozen_exe_path():
 
 `current_dist_dir()` 與 exe 名稱（`Get-Process` 用的）都要從這個 helper 來，**不要直接信任 `sys.executable`**。
 
-### 坑 3：PowerShell `Start-Process` 預設走 ShellExecute 會卡住
+### 坑 3：PowerShell 5.1 的 `Start-Process` 沒有 `-UseShellExecute`，預設 ShellExecute 會卡住
 
-- **現象**：背景替換腳本卡在重啟那一步，超過 2 分鐘無回應（沙盒實測）。
-- **根因**：Windows PowerShell 5.1 的 `Start-Process` 預設用 **ShellExecute** 啟動；遇到無效 exe 或特定 manifest 的程式，ShellExecute 會彈對話框或直接卡住。
-- **解法**：加 `-UseShellExecute $false`（改走 CreateProcess，直接繼承權限、行為可預期）：
+- **現象**：背景替換腳本在重啟那一步拋「找不到符合參數名稱 'UseShellExecute' 的參數」；若改用預設 ShellExecute，又會卡住超過 2 分鐘（沙盒實測）。
+- **根因**：`-UseShellExecute` 是 **PowerShell 7+（Core）才有的參數**；Windows PowerShell 5.1 的 `Start-Process` 沒有這個參數，而且預設走 ShellExecute，遇到無效 exe 或特定 manifest 會彈對話框或直接卡住。
+- **解法**：改用 .NET `ProcessStartInfo` 設定 `UseShellExecute = $false`（走 CreateProcess，跨 PS 5.1 / 7 行為一致）：
 
 ```powershell
-Start-Process -FilePath $Exe -WorkingDirectory $Dist -UseShellExecute $false -ErrorAction Stop
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $Exe
+$psi.WorkingDirectory = $Dist
+$psi.UseShellExecute = $false   # 走 CreateProcess，不經 ShellExecute
+[System.Diagnostics.Process]::Start($psi) | Out-Null
 ```
+
+> ⚠️ 不要寫 `Start-Process -UseShellExecute $false`：該參數在 PS 5.1 不存在，會直接拋參數綁定錯誤。
 
 ### 坑 4：PowerShell 5.1 讀無 BOM 的 UTF-8 會亂碼
 

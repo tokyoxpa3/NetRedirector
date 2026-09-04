@@ -246,7 +246,11 @@ L "config preserved"
 # 4. relaunch the app
 if ($ok) {
     try {
-        Start-Process -FilePath $Exe -WorkingDirectory $Dist -UseShellExecute $false -ErrorAction Stop
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.WorkingDirectory = $Dist
+        $psi.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
         L "restart OK"
     } catch {
         L ("restart FAIL: " + $_)
