@@ -48,3 +48,9 @@ config.json.corrupt.bak
 
 # 關閉流程診斷計時檔 (IntegratedApp.py 關閉時寫入)
 /shutdown_timing.log
+
+# VPN 節點歷史 (執行期資料,含個人節點使用紀錄,不得進版控)
+vpn_history.json
+
+# ZCode 工具工作目錄
+.zcode/

@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def test_all_modules_importable():
     for mod in ["app_helpers", "config_store", "rule_utils",
-                "tabs_hub", "tabs_rules", "tabs_proxies", "tabs_monitor"]:
+                "tabs_hub", "tabs_rules", "tabs_proxies", "tabs_monitor",
+                "tabs_vpngate", "vpngate", "vpn_history"]:
         importlib.import_module(mod)
 
 
@@ -35,7 +36,8 @@ def test_no_undefined_names_in_mixins():
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     files = ["IntegratedApp.py", "app_helpers.py", "config_store.py", "rule_utils.py",
-             "tabs_hub.py", "tabs_rules.py", "tabs_proxies.py", "tabs_monitor.py"]
+             "tabs_hub.py", "tabs_rules.py", "tabs_proxies.py", "tabs_monitor.py",
+             "tabs_vpngate.py", "vpngate.py", "vpn_history.py"]
     r = subprocess.run(
         [sys.executable, "-m", "pyflakes", *[os.path.join(repo, f) for f in files]],
         capture_output=True, text=True,
@@ -51,7 +53,9 @@ def test_mainwindow_inherits_all_mixins():
     from tabs_rules import RulesTabMixin
     from tabs_proxies import ProxiesTabMixin
     from tabs_monitor import MonitorTabMixin
+    from tabs_vpngate import VpnGateTabMixin
     assert issubclass(MainWindow, HubTabMixin)
     assert issubclass(MainWindow, RulesTabMixin)
     assert issubclass(MainWindow, ProxiesTabMixin)
     assert issubclass(MainWindow, MonitorTabMixin)
+    assert issubclass(MainWindow, VpnGateTabMixin)

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import requests
 
 import vpngate_config as config
+import vpn_history
 
 
 @dataclass
@@ -135,6 +136,34 @@ def rank_nodes(
             ]
     candidates.sort(key=lambda n: (-n.score, n.ping_ms))
     return candidates
+
+
+def node_from_record(rec: dict) -> VpnGateNode:
+    """把 vpn_history 的節點記錄還原成 VpnGateNode (快照欄位)。"""
+    return VpnGateNode(
+        hostname=rec.get("hostname", ""),
+        ip=rec["ip"],
+        score=rec.get("last_score", 0),
+        ping_ms=rec.get("last_ping", 0),
+        speed_bps=rec.get("last_speed", 0),
+        country_long=rec.get("country_long", ""),
+        country_short=rec.get("country_short", ""),
+        num_sessions=0,
+        port=rec.get("port", 0),
+    )
+
+
+def rank_by_stability(nodes: list[VpnGateNode], history: dict) -> list[VpnGateNode]:
+    """依穩定度遞減排序 (官方 Score 與 Ping 為 tiebreaker)。"""
+    pool = history.get("nodes", {})
+    return sorted(
+        nodes,
+        key=lambda n: (
+            -vpn_history.stability(pool.get(n.ip, {})),
+            -n.score,
+            n.ping_ms,
+        ),
+    )
 
 
 if __name__ == "__main__":

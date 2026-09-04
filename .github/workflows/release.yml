@@ -1,0 +1,70 @@
+# NetRedirector Release — 打 tag (v*) 自動建 GitHub Release
+# 流程: 改寫 version.py → 編譯 DLL + Nuitka standalone → zip → SHA256 → 發佈
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (cl)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # 把 tag (v1.7.0) 寫進 version.py，讓 Nuitka 將正確版本編譯進 exe
+      - name: Compile DLL + Nuitka standalone
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '^v',''
+          $raw = Get-Content version.py -Raw
+          $raw = $raw -replace 'APP_VERSION\s*=\s*"[^"]*"', ('APP_VERSION = "' + $v + '"')
+          Set-Content version.py -Value $raw -NoNewline -Encoding utf8
+          Write-Host "Baking version: $v"
+          Get-Content version.py | Select-Object -First 4
+          ./build.ps1 -Standalone
+        env:
+          PYTHONUTF8: '1'
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $dist = Get-ChildItem -Directory -Filter "*.dist" | Select-Object -First 1
+          if (-not $dist) { throw "No .dist output folder found" }
+          $ver = $env:GITHUB_REF_NAME -replace '^v',''
+          $zip = "NetRedirector-v$ver-win64.zip"
+          Compress-Archive -Path (Join-Path $dist.FullName '*') -DestinationPath $zip -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP=$zip"
+
+      - name: Generate SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash $env:ZIP -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ZIP" | Set-Content -Path SHA256SUMS.txt -Encoding ascii
+          Write-Host "SHA256SUMS:"
+          Get-Content SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:ZIP SHA256SUMS.txt `
+            --repo $env:GITHUB_REPOSITORY --title $env:GITHUB_REF_NAME --generate-notes

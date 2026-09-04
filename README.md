@@ -226,6 +226,27 @@ NetRedirector/
 推送到 `main` 分支會自動觸發 GitHub Actions (`.github/workflows/build.yml`)：
 編譯 C DLL → 語法/匯入 smoke test → Nuitka standalone 打包 → 上傳建置產物。
 
+### 發佈 (Release) 與自動更新
+
+- **版本管理**：版本號唯一來源在 `version.py` 的 `APP_VERSION`。發佈新版本時：
+  1. 手動遞增 `version.py` 的版本號並提交；
+  2. 打上一致的 git tag（例如 `v1.7.0`）並推送。
+
+- **自動發佈**：推送 `v*` tag 會觸發 `.github/workflows/release.yml`，
+  自動把 tag 版本寫入 `version.py`、編譯 DLL + Nuitka standalone 打包、壓成
+  `NetRedirector-vX.Y.Z-win64.zip`、產生 `SHA256SUMS.txt`，並建立 GitHub Release。
+
+- **程式內自動更新**：應用程式的「說明 → 檢查更新」會查詢 GitHub 最新 Release，
+  比對版本；有新版本時下載 zip、以 `SHA256SUMS.txt` 做 SHA-256 完整性校驗，
+  解壓到暫存目錄後啟動背景替換腳本，關閉主程式 → 交換資料夾 → 重新啟動。
+  頂部列「啟動時自動檢查更新」勾選後，程式啟動時會背景靜默檢查。
+
+- **安全**：下載的更新檔**必須**通過 SHA-256 校驗才會解壓、替換，防止被竄改。
+  更新僅替換應用程式目錄，不重複安裝 WinDivert 驅動。
+
+- **程式碼簽章**：未簽章的 Nuitka 執行檔 + 驅動安裝可能觸發 SmartScreen / 防毒
+  誤報。正式對外釋出建議加上 Authenticode 程式碼簽章。
+
 ---
 
 ## ❓ 常見問題與故障排除 (FAQ)

@@ -31,7 +31,7 @@ def sample_state():
 
 def test_build_config_data_structure():
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "1.1.1.1", {1080: ["A"]}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "1.1.1.1", False, {1080: ["A"]}, proxies, rules)
     assert data["lang"] == "zh_TW"
     assert data["ping_target"] == "1.1.1.1"
     assert data["hubs"] == {1080: ["A"]}
@@ -41,7 +41,7 @@ def test_build_config_data_structure():
 
 def test_proxy_password_dpapi_encrypted():
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "", {}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
     enc = data["proxies"][0]["pass"]
     assert enc.startswith(secure_config.PREFIX)
     assert "secret123" not in enc
@@ -53,7 +53,7 @@ def test_proxy_password_dpapi_encrypted():
 
 def test_rules_preserve_ui_fields():
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "", {}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
     r = data["rules"][0]
     assert r["proxy_text"] == "[Custom] P1"
     assert r["target"] == "chrome.exe"
@@ -64,7 +64,7 @@ def test_rules_preserve_ui_fields():
 def test_rules_persist_proxy_name():
     """proxy_name (穩定識別) 必須持久化;舊規則無此欄位時存空字串。"""
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "", {}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
     assert data["rules"][0]["proxy_name"] == "P1"
     # sample_state 第二條規則沒有 proxy_name → 序列化為空字串 (向後相容)
     assert data["rules"][1]["proxy_name"] == ""
@@ -72,7 +72,7 @@ def test_rules_persist_proxy_name():
 
 def test_dynamic_fields_removed():
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "", {}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
     # latency / id 不得出現在序列化結果
     assert "latency" not in data["proxies"][0]
     assert "id" not in data["proxies"][0]
@@ -80,7 +80,7 @@ def test_dynamic_fields_removed():
 
 def test_save_and_load_roundtrip(tmp_path):
     proxies, rules = sample_state()
-    data = config_store.build_config_data("zh_TW", "8.8.8.8", {}, proxies, rules)
+    data = config_store.build_config_data("zh_TW", "8.8.8.8", False, {}, proxies, rules)
     path = os.path.join(tmp_path, "config.json")
     assert config_store.save_config_file(path, data) is None
     loaded = config_store.load_config_file(path)
@@ -167,3 +167,18 @@ def test_save_is_atomic_no_tmp_left_behind(tmp_path):
 def test_save_to_bad_path_returns_error():
     err = config_store.save_config_file("Z:/no/such/dir/config.json", {})
     assert err is not None
+
+
+def test_check_updates_default_and_roundtrip(tmp_path):
+    """check_updates 預設開啟、可關閉，且序列化往返保留。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
+    assert data["check_updates"] is True
+
+    data_off = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules, False)
+    assert data_off["check_updates"] is False
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data_off) is None
+    assert config_store.load_config_file(path)["check_updates"] is False
+

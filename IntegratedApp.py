@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QListWidget, QSplitter, QMessageBox, QHeaderView,
                              QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
                              QSystemTrayIcon, QCheckBox)
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
 from i18n import i18n as tr, SUPPORTED_LANGS
@@ -35,6 +35,42 @@ from tabs_proxies import ProxiesTabMixin
 from tabs_monitor import MonitorTabMixin
 from tabs_vpngate import VpnGateTabMixin
 
+import updater  # [自動更新] 檢查/下載/替換邏輯
+from version import APP_VERSION  # [自動更新] 單一版本來源
+
+
+class UpdateWorker(QThread):
+    """背景檢查更新 (呼叫 GitHub API，避免阻塞 UI)。"""
+    result = Signal(object)  # dict(有更新) | None(最新) | Exception(錯誤)
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            self.result.emit(updater.check_update(self.current_version))
+        except Exception as e:  # noqa: BLE001 — 網路錯誤需回報 UI
+            self.result.emit(e)
+
+
+class StageWorker(QThread):
+    """背景下載並驗證更新 (回傳新版本目錄路徑)。"""
+    result = Signal(object)  # str(new_dir) | Exception
+
+    def __init__(self, info):
+        super().__init__()
+        self.info = info
+
+    def run(self):
+        try:
+            path = updater.stage_update(
+                self.info["url"], self.info["asset_name"], self.info["checksum_url"])
+            self.result.emit(path)
+        except Exception as e:
+            self.result.emit(e)
+
+
 class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, MonitorTabMixin, VpnGateTabMixin):
     update_proxy_table_signal = Signal() 
     CONFIG_FILE = "config.json"  # [新增] 設定檔路徑
@@ -54,6 +90,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self._really_quit = False      # True 時關閉即真正離開程式
         self._tray_notified = False    # 是否已顯示過「縮到匣」提示
         self._tray_icon = None         # QSystemTrayIcon 實例 (延後於 setup_ui 後建立)
+
+        # 自動更新狀態
+        self.check_updates_on_start = True
+        self.update_worker = None
+        self.stage_worker = None
+        self._update_checked = False
 
         dll_path = "NetRedirector.dll"
         
@@ -101,6 +143,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         # UI 初始化
         self.setup_ui()
 
+        # 選單列 (說明 → 檢查更新 / 關於)
+        self._setup_menu_bar()
+
         # 系統匣 (需在 setup_ui 之後，chkbox 已存在；且需有 QApplication)
         self._setup_tray()
 
@@ -124,6 +169,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         # [新增] 載入設定
         QTimer.singleShot(100, self.load_config)
+
+        # [自動更新] 啟動時背景檢查 (延後至設定載入完成後，依設定決定是否執行)
+        QTimer.singleShot(1200, self._on_startup_update_check)
 
         self.append_log("系統就緒。")
 
@@ -242,7 +290,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         data = config_store.build_config_data(
             tr.lang, self.ping_target,
             self.chk_minimize_to_tray.isChecked() if hasattr(self, 'chk_minimize_to_tray') else False,
-            self.port_config, self.custom_proxies, self.rules)
+            self.port_config, self.custom_proxies, self.rules,
+            self.chk_check_updates.isChecked() if hasattr(self, 'chk_check_updates') else True)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
             self.append_log("設定已儲存至 config.json")
@@ -278,6 +327,11 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             # 還原「關閉時縮到系統匣」
             if hasattr(self, 'chk_minimize_to_tray'):
                 self.chk_minimize_to_tray.setChecked(bool(data.get("minimize_to_tray", False)))
+
+            # 還原「啟動時自動檢查更新」
+            self.check_updates_on_start = bool(data.get("check_updates", True))
+            if hasattr(self, 'chk_check_updates'):
+                self.chk_check_updates.setChecked(self.check_updates_on_start)
 
             self.append_log("正在還原設定...")
 
@@ -378,6 +432,13 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
+        # 提前建立日誌控制項：VPN Gate 分頁初始化時 (setup_vpngate_tab) 會
+        # 在載入既有節點池後呼叫 vpn_apply_filters → append_log；若等到下方
+        # log_group 才建立 txt_log，會在啟動時就先存取不存在的屬性而崩潰。
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
+
         # 頂部控制列
         top_bar = QHBoxLayout()
         self.btn_master_switch = QPushButton("")
@@ -407,11 +468,16 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.chk_minimize_to_tray.setChecked(False)
         self.chk_minimize_to_tray.setToolTip(self.t("勾選後，按關閉會直接縮到系統匣，不詢問"))
 
+        self.chk_check_updates = QCheckBox("")
+        self._reg("text", self.chk_check_updates, "啟動時自動檢查更新")
+        self.chk_check_updates.setChecked(self.check_updates_on_start)
+
         top_bar.addStretch()
         top_bar.addWidget(lbl_ping)
         top_bar.addWidget(self.ent_ping_target)
         top_bar.addWidget(self.combo_lang)
         top_bar.addWidget(self.chk_minimize_to_tray)
+        top_bar.addWidget(self.chk_check_updates)
         main_layout.addLayout(top_bar)
 
         self.tabs = QTabWidget()
@@ -445,9 +511,6 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         log_group = QGroupBox("")
         self._reg("title", log_group, "系統日誌")
         log_layout = QVBoxLayout()
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
         log_layout.addWidget(self.txt_log)
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group)
@@ -492,6 +555,93 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         c = self.txt_log.textCursor()
         c.movePosition(c.MoveOperation.End)
         self.txt_log.setTextCursor(c)
+
+    # --------------------------------------------------------- 自動更新
+    def _setup_menu_bar(self):
+        """建立選單列：說明 → 檢查更新 / 關於。"""
+        help_menu = self.menuBar().addMenu(self.t("說明"))
+
+        self.act_check_update = help_menu.addAction(self.t("檢查更新"))
+        self.act_check_update.triggered.connect(lambda: self.check_for_updates(silent=False))
+
+        help_menu.addSeparator()
+
+        self.act_about = help_menu.addAction(self.t("關於"))
+        self.act_about.triggered.connect(self._show_about)
+
+        # 註冊 i18n (切換語言時重譯選單文字)
+        self._reg("text", self.act_check_update, "檢查更新")
+        self._reg("text", self.act_about, "關於")
+        self._reg("text", help_menu.menuAction(), "說明")
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            self.t("關於 NetRedirector"),
+            f"{self.t('NetRedirector x GameProxyHub 整合專業版')}\n\n"
+            f"{self.t('版本:')} {APP_VERSION}"
+        )
+
+    def _on_startup_update_check(self):
+        """啟動時若「自動檢查更新」已勾選，且本次尚未檢查過，則背景查一次。"""
+        if self.check_updates_on_start and not self._update_checked:
+            self._update_checked = True
+            self.check_for_updates(silent=True)
+
+    def check_for_updates(self, silent=False):
+        if self.update_worker is not None and self.update_worker.isRunning():
+            return
+        if not silent:
+            self.append_log(self.t("正在檢查更新..."))
+        self.update_worker = UpdateWorker(APP_VERSION)
+        self.update_worker.result.connect(
+            lambda r: self._on_update_check_result(r, silent))
+        self.update_worker.start()
+
+    def _on_update_check_result(self, result, silent):
+        if isinstance(result, Exception):
+            msg = f"{self.t('檢查更新失敗:')} {result}"
+            self.append_log(msg)
+            if not silent:
+                QMessageBox.warning(self, self.t("檢查更新"), msg)
+            return
+        if result is None:
+            if not silent:
+                QMessageBox.information(self, self.t("檢查更新"), self.t("已是最新版本。"))
+            return
+        # 有新版本 → 詢問是否下載安裝
+        text = self.t("發現新版本 {v}，是否下載並安裝？").format(v=result["version"])
+        reply = QMessageBox.question(self, self.t("檢查更新"), text)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_stage(result)
+
+    def _start_stage(self, info):
+        if self.stage_worker is not None and self.stage_worker.isRunning():
+            return
+        self.act_check_update.setEnabled(False)
+        self.append_log(self.t("正在下載更新..."))
+        self.stage_worker = StageWorker(info)
+        self.stage_worker.result.connect(self._on_stage_result)
+        self.stage_worker.start()
+
+    def _on_stage_result(self, result):
+        self.act_check_update.setEnabled(True)
+        if isinstance(result, Exception):
+            msg = f"{self.t('檢查更新失敗:')} {result}"
+            self.append_log(msg)
+            QMessageBox.warning(self, self.t("檢查更新"), msg)
+            return
+        text = self.t("更新下載完成，重新啟動後生效。是否立即重新啟動？")
+        reply = QMessageBox.question(self, self.t("檢查更新"), text)
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                updater.apply_and_restart()
+            except Exception as e:
+                QMessageBox.warning(self, self.t("檢查更新"), str(e))
+                return
+            self._really_quit = True
+            self._perform_shutdown()
+            QApplication.instance().quit()
 
     # --------------------------------------------------------- 系統匣
     def _setup_tray(self):
