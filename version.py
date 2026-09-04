@@ -8,7 +8,7 @@ CI 建立 release 時，會把下方的 APP_VERSION 改寫成對應的 git tag �
 本機開發／日常提交請在此手動遞增版本，並於發佈時打上一致的 git tag。
 """
 
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 
 # GitHub 更新來源 (release API)
 GITHUB_REPO = "tokyoxpa3/NetRedirector"
