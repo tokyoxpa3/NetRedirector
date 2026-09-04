@@ -184,62 +184,72 @@ def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD)
 
 
 def _apply_script_content():
-    """回傳背景替換腳本 (PowerShell) 內容；路徑以參數傳入，避免引號／編碼問題。"""
+    """產生背景替換腳本 (PowerShell)。
+
+    內容保持純 ASCII，避免 PowerShell 5.1 將無 BOM 的 UTF-8 誤讀為 ANSI，
+    使中文註解變成亂碼 (甚至造成解析問題)。日誌路徑以參數 $Log 傳入，
+    不再依賴 $env:TEMP。
+    """
     return r'''param(
     [string]$Dist,
     [string]$NewDir,
     [string]$OldDir,
     [string]$Exe,
-    [string]$ExeName
+    [string]$ExeName,
+    [string]$Log
 )
 $ErrorActionPreference = 'SilentlyContinue'
+function L([string]$m) { Add-Content -Path $Log -Value ((Get-Date -Format o) + "  " + $m) -ErrorAction SilentlyContinue }
 
-# 需跨版本保留的執行期資料 (設定檔、VPN 節點歷史)
-$runtimeFiles = @('config.json', 'vpn_history.json')
+L ("apply start  Dist=[" + $Dist + "] NewDir=[" + $NewDir + "] OldDir=[" + $OldDir + "] Exe=[" + $Exe + "] ExeName=[" + $ExeName + "]")
 
-# 1. 等主程式完全退出 (程式檔名不含 .exe)
-while (Get-Process -Name $ExeName -ErrorAction SilentlyContinue) {
-    Start-Sleep -Seconds 1
-}
+# 1. wait for the app to fully exit (name without .exe)
+while (Get-Process -Name $ExeName -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+L "app exited"
 
-# 2. 清理上次更新殘留的舊版本資料夾
-if (Test-Path $OldDir) { Remove-Item $OldDir -Recurse -Force }
+# 2. remove leftover old version
+if (Test-Path $OldDir) { Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue }
+L "old cleared"
 
-# 3. 原子交換：dist → old、new → dist (重試以等待檔案解鎖)
+# 3. atomic swap: Dist -> OldDir, NewDir -> Dist (retry for file unlock)
 $ok = $false
 for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
-    if ((Test-Path $Dist) -and (Test-Path $NewDir)) {
-        Rename-Item $Dist $OldDir -Force -ErrorAction SilentlyContinue
-    }
-    if ((Test-Path $NewDir) -and -not (Test-Path $Dist)) {
-        Rename-Item $NewDir $Dist -Force -ErrorAction SilentlyContinue
-    }
+    if ((Test-Path $Dist) -and (Test-Path $NewDir)) { Rename-Item $Dist $OldDir -Force -ErrorAction SilentlyContinue }
+    if ((Test-Path $NewDir) -and -not (Test-Path $Dist)) { Rename-Item $NewDir $Dist -Force -ErrorAction SilentlyContinue }
     if (Test-Path $Exe) { $ok = $true } else { Start-Sleep -Seconds 1 }
 }
+L ("swap ok=" + $ok)
 
-# 3.5 保留執行期資料:從舊版搬回新版,避免更新後設定被清零
-foreach ($f in $runtimeFiles) {
+# 3.5 preserve runtime data (config, vpn history)
+foreach ($f in @('config.json','vpn_history.json')) {
     $src = Join-Path $OldDir $f
-    if ((Test-Path $src) -and (Test-Path $Dist)) {
-        Copy-Item $src (Join-Path $Dist $f) -Force -ErrorAction SilentlyContinue
-    }
+    if ((Test-Path $src) -and (Test-Path $Dist)) { Copy-Item $src (Join-Path $Dist $f) -Force -ErrorAction SilentlyContinue }
 }
+L "config preserved"
 
-# 4. 重新啟動 (失敗寫入 %TEMP% 日誌供偵錯)
+# 4. relaunch the app
 if ($ok) {
-    $logPath = Join-Path $env:TEMP 'NetRedirector_update.log'
     try {
-        Start-Process -FilePath $Exe -WorkingDirectory $Dist -ErrorAction Stop
-        Add-Content -Path $logPath -Value "RESTART OK  $([DateTime]::Now.ToString('o'))"
+        Start-Process -FilePath $Exe -WorkingDirectory $Dist -UseShellExecute $false -ErrorAction Stop
+        L "restart OK"
     } catch {
-        Add-Content -Path $logPath -Value "RESTART FAIL  $([DateTime]::Now.ToString('o'))  $_"
+        L ("restart FAIL: " + $_)
     }
+} else {
+    L "restart skipped (swap failed)"
 }
 
-# 5. 背景清除舊版本 (不阻塞新程式啟動)
+# 5. cleanup old version (sync retry; the new app is already relaunching)
 if (Test-Path $OldDir) {
-    Start-Job -ScriptBlock { param($p) Remove-Item $p -Recurse -Force } -ArgumentList $OldDir | Out-Null
+    $cleaned = $false
+    for ($i = 0; $i -lt 10 -and -not $cleaned; $i++) {
+        Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $OldDir)) { $cleaned = $true } else { Start-Sleep -Seconds 1 }
+    }
+    L ("cleanup done=" + $cleaned)
 }
+
+L "apply done"
 '''
 
 
@@ -260,15 +270,23 @@ def apply_and_restart():
     install_dir = os.path.dirname(dist_dir)
 
     script_path = os.path.join(install_dir, "apply_update.ps1")
-    with open(script_path, "w", encoding="utf-8") as f:
+    log_path = os.path.join(install_dir, "update_apply.log")
+    err_path = os.path.join(install_dir, "update_apply_err.log")
+
+    # 以 UTF-8 BOM 寫入，確保 PowerShell 5.1 正確辨識編碼
+    with open(script_path, "w", encoding="utf-8-sig") as f:
         f.write(_apply_script_content())
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", script_path,
-         "-Dist", dist_dir, "-NewDir", new_dir, "-OldDir", old_dir,
-         "-Exe", exe_path, "-ExeName", exe_name],
-        cwd=install_dir,
-        creationflags=creationflags,
-    )
+    # stderr 導到獨立檔案，捕捉 powershell 本身的解析/執行錯誤
+    with open(err_path, "ab") as err_fd:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", script_path,
+             "-Dist", dist_dir, "-NewDir", new_dir, "-OldDir", old_dir,
+             "-Exe", exe_path, "-ExeName", exe_name, "-Log", log_path],
+            cwd=install_dir,
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=err_fd,
+        )
