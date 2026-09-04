@@ -54,3 +54,6 @@ vpn_history.json
 
 # ZCode 工具工作目錄
 .zcode/
+
+# 自動更新的背景替換腳本 (更新時寫入,屬執行期產物)
+apply_update.ps1
