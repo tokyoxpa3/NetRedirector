@@ -109,8 +109,20 @@ def _parse_expected_sha256(checksum_text, asset_name):
 
 
 def is_frozen():
-    """Nuitka 打包後 sys.frozen 為 True；開發模式 (跑 .py) 為 False。"""
-    return bool(getattr(sys, "frozen", False))
+    """是否執行於打包後的可執行檔。
+
+    - PyInstaller / cx_Freeze 會設 ``sys.frozen``
+    - PyInstaller onefile 會設 ``sys._MEIPASS``
+    - Nuitka 不會設 ``sys.frozen``，而是在每個編譯模組的 globals 注入
+      ``__compiled__ = True``（此函式的 globals 即為 updater 模組字典）
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    if hasattr(sys, "_MEIPASS"):
+        return True
+    if globals().get("__compiled__", False):
+        return True
+    return False
 
 
 def current_dist_dir():
@@ -220,7 +232,7 @@ def apply_and_restart():
     僅在打包後的可執行檔中允許 (開發模式直接丟例外，避免誤動 repo 目錄)。
     """
     if not is_frozen():
-        raise RuntimeError("自動更新僅支援打包後的可執行檔")
+        raise RuntimeError("自動更新的套用/替換步驟僅支援打包後的可執行檔（目前偵測為原始碼/開發模式執行）")
 
     dist_dir = current_dist_dir()
     exe_path = sys.executable

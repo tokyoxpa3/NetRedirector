@@ -47,6 +47,16 @@ def test_verify_sha256(tmp_path):
 
 
 def test_parse_expected_sha256():
-    text = "abc123  NetRedirector-v1.7.0-win64.zip\n"
-    assert updater._parse_expected_sha256(text, "NetRedirector-v1.7.0-win64.zip") == "abc123"
+    text = "abc123  NetRedirector-v1.6.2-win64.zip\n"
+    assert updater._parse_expected_sha256(text, "NetRedirector-v1.6.2-win64.zip") == "abc123"
     assert updater._parse_expected_sha256(text, "nonexistent.zip") is None
+
+
+def test_is_frozen_detects_nuitka_compiled(monkeypatch):
+    """Nuitka 以 __compiled__ 注入凍結旗標，is_frozen() 必須能辨識。"""
+    monkeypatch.setattr(updater, "__compiled__", True, raising=False)
+    assert updater.is_frozen() is True
+
+    monkeypatch.setattr(updater, "__compiled__", False, raising=False)
+    assert updater.is_frozen() is False
+
