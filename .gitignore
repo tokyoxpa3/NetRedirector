@@ -57,3 +57,7 @@ vpn_history.json
 
 # 自動更新的背景替換腳本 (更新時寫入,屬執行期產物)
 apply_update.ps1
+
+# 自動更新的日誌檔 (更新時寫入,屬執行期產物)
+update_apply.log
+update_apply_err.log
