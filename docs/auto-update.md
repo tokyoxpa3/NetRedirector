@@ -248,6 +248,29 @@ foreach ($f in @('config.json','vpn_history.json')) {
   2. 提交前先 `git branch --show-current` 確認不在 detached HEAD。
   3. 提交後 `git log --oneline main -N` 驗證歷史完整。
 
+### 坑 11：Python 啟動背景替換腳本要用 `CREATE_NO_WINDOW`，不能用 `DETACHED_PROCESS`
+
+- **現象**：主程式按「是」後正常關閉，但**沒有更新、也沒有重啟**；替換腳本的 log 完全沒寫出來（`update.log` 不存在、stderr 是 0 bytes），彷彿腳本從沒執行過。
+- **根因**：`subprocess.Popen(..., creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)` 建立的 PowerShell 子程序啟動後就「消失」——被建立但沒真正跑到腳本內容，連第一行 log 都沒留下。這個 flag 組合對 `powershell.exe -File` 啟動背景腳本不可靠。
+- **解法**：改用 `CREATE_NO_WINDOW`；路徑改走命令列參數（`-Dist -NewDir -OldDir -Exe -ExeName -Log`）；腳本以 `utf-8-sig`（BOM）寫入（見坑 4）；`$ErrorActionPreference = 'SilentlyContinue'`：
+
+```python
+creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+with open(err_path, "ab") as err_fd:
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", script_path,
+         "-Dist", dist_dir, "-NewDir", new_dir, "-OldDir", old_dir,
+         "-Exe", exe_path, "-ExeName", exe_name, "-Log", log_path],
+        cwd=install_dir,
+        creationflags=creationflags,
+        stdout=subprocess.DEVNULL,
+        stderr=err_fd,
+    )
+```
+
+> 偵錯技巧：先看替換腳本 log 有沒有 `apply start` 這第一行；若完全沒有，代表腳本根本沒被執行，優先懷疑 creationflag 用錯了。
+
 ---
 
 ## 六、安全注意事項
