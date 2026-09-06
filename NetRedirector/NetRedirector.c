@@ -441,6 +441,75 @@ static DWORD WINAPI dns_refresh_worker(LPVOID arg)
     return 0;
 }
 
+// === Windows 防火牆規則管理 ===
+//
+// WinDivert 把 NAT 重寫後的封包當作「inbound」重新注入：來源是原始(公開)
+// 目的地、目的地是本機的 local relay port。Windows 防火牆(或第三方防火牆)
+// 會把這筆視為「從網際網路入站連到 relay port」，在預設的 drop/stealth 姿勢下
+// 靜默丟棄 SYN → 所有走代理的連線黑洞，表現就是典型的 ~21 秒 TCP 連線逾時。
+// relay 本身 bind 得好好地，pre-flight 的 bind probe 抓不到這種失敗，缺的那一半
+// 就是防火牆規則。因此 Start 時替兩個 relay port 加一條入站允許規則，Stop 時移除。
+//
+// 規則刻意不用 localsubnet 限定：NAT swap 之後注入封包的來源是原始公開目的地，
+// 永遠不會是本地位址。relay 只接受「能對上 conntrack 表」的連線(對不上的立刻
+// 關閉)，所以放行任意來源入站到這兩個 port 並不會開啟一個可被利用的服務。
+//
+// 盡力而為(best-effort)：防火牆本來就寬鬆、或使用者已有相同規則的環境，不需要
+// 這條規則；失敗只記錄 log，不當成 Start 錯誤(要維持原本寬鬆環境能正常運作)。
+static BOOL g_firewall_rule_active = FALSE;
+
+static void run_netsh_firewall(const char *args)
+{
+    char cmdline[512];
+    snprintf(cmdline, sizeof(cmdline), "netsh.exe %s", args);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    memset(&pi, 0, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        log_message("防火牆規則: 無法啟動 netsh (%lu)", GetLastError());
+        return;
+    }
+    WaitForSingleObject(pi.hProcess, 10000);
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    if (exit_code != 0) {
+        log_message("防火牆規則: netsh 回傳 %lu (%s)", exit_code, args);
+    } else {
+        log_message("防火牆規則已更新: %s", args);
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
+static void set_relay_firewall_rules(BOOL enable)
+{
+    if (!enable && !g_firewall_rule_active) return; // 本來就沒加，無需移除
+
+    char cmd[256];
+    const char *op = enable ? "add" : "delete";
+
+    snprintf(cmd, sizeof(cmd),
+        "advfirewall firewall %s rule name=\"NetRedirector Relay TCP %u\" "
+        "dir=in action=allow protocol=TCP localport=%u",
+        op, (unsigned)g_local_relay_port, (unsigned)g_local_relay_port);
+    run_netsh_firewall(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+        "advfirewall firewall %s rule name=\"NetRedirector Relay UDP %u\" "
+        "dir=in action=allow protocol=UDP localport=%u",
+        op, (unsigned)LOCAL_UDP_RELAY_PORT, (unsigned)LOCAL_UDP_RELAY_PORT);
+    run_netsh_firewall(cmd);
+
+    g_firewall_rule_active = enable;
+}
+
 NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 {
     char filter[1024];
@@ -587,6 +656,9 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
         goto fail;
     }
 
+    // 放行防火牆，讓重寫後 re-inject 回來的 inbound relay 封包能送達本機。
+    set_relay_firewall_rules(TRUE);
+
     // [Added] These are best-effort tuning knobs (16384 is the allowed max),
     // but a silent failure would leave the queue at the small default and
     // cost throughput under load - leave a trace instead.
@@ -642,6 +714,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     return TRUE;
 
 fail:
+    set_relay_firewall_rules(FALSE);
     // running is already FALSE, so every server thread exits its loop on its
     // own. Wake the sleepers first (same as Stop), close WinDivert to unblock
     // any packet_processor threads, then wait for and close every handle that
@@ -742,6 +815,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Stop(void)
     clear_pid_cache();        // Drop stale PID/process-name cache entries
     clear_dns_cache();        // [Added] Drop stale domain-rule DNS resolution cache
     clear_dns_snoop_cache();  // [Added] Drop stale DNS-snoop IP->domain cache
+    set_relay_firewall_rules(FALSE);   // 移除 relay 入站允許規則
 
     log_message("NetRedirector stopped");
     return TRUE;
