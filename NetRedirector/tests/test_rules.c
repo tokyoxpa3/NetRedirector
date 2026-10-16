@@ -99,5 +99,60 @@ int main(void)
         NetRedirector_DeleteRule(r);
     }
 
+    printf("== DNS with an unattributable pid (dns_via_proxy) ==\n");
+    {
+        // check_process_rule(..., pid_in=0, have_pid=TRUE) is exactly what
+        // handle_new_connection_logic() hands over when the table lookup found
+        // no owner - the routine case for a DNS datagram, since the client
+        // socket is usually gone before the lookup runs.
+        UINT8 dst[16] = {8, 8, 8, 8};
+        UINT8 src[16] = {192, 168, 1, 200};
+        UINT32 out = 77;
+
+        // A default proxy has to exist: without one the validation tail
+        // downgrades every PROXY verdict to DIRECT, and the test would pass
+        // for entirely the wrong reason.
+        NetRedirector_SetProxyConfig(PROXY_TYPE_SOCKS5, "127.0.0.1", 1080, "", "");
+
+        UINT32 r = NetRedirector_AddRuleWithProxy("*", "*", "*", RULE_PROTOCOL_BOTH, RULE_ACTION_PROXY, 0);
+
+        NetRedirector_SetDnsViaProxy(TRUE);
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 53, TRUE, &out, 0, TRUE) == RULE_ACTION_PROXY,
+              "unattributed UDP DNS follows the catch-all rule -> PROXY");
+        CHECK(out == 0, "proxy id 0 -> the default proxy");
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 53, FALSE, &out, 0, TRUE) == RULE_ACTION_PROXY,
+              "same for TCP DNS (the preference is not protocol specific)");
+
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 443, TRUE, &out, 0, TRUE) == RULE_ACTION_DIRECT,
+              "non-DNS still takes the unknown-process action");
+        CHECK(out == 0, "proxy id cleared on the unknown-process path");
+
+        NetRedirector_SetDnsViaProxy(FALSE);
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 53, TRUE, &out, 0, TRUE) == RULE_ACTION_DIRECT,
+              "dns_via_proxy off -> DIRECT despite the catch-all PROXY rule");
+        CHECK(out == 0, "proxy id cleared");
+
+        NetRedirector_SetDnsViaProxy(TRUE);
+        NetRedirector_DeleteRule(r);
+
+        // The fall-through must only let name-agnostic rules decide: a rule
+        // that names a process cannot start matching an empty name.
+        UINT32 rn = NetRedirector_AddRuleWithProxy("chrome.exe", "*", "*", RULE_PROTOCOL_BOTH, RULE_ACTION_PROXY, 0);
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 53, TRUE, &out, 0, TRUE) == RULE_ACTION_DIRECT,
+              "name-specific rule does not match an empty name");
+        NetRedirector_DeleteRule(rn);
+
+        UINT32 rd = NetRedirector_AddRuleWithProxy("*", "*", "*", RULE_PROTOCOL_BOTH, RULE_ACTION_DIRECT, 0);
+        out = 77;
+        CHECK(check_process_rule(AF_INET, src, 5555, dst, 53, TRUE, &out, 0, TRUE) == RULE_ACTION_DIRECT,
+              "catch-all DIRECT -> DIRECT");
+        NetRedirector_DeleteRule(rd);
+    }
+
     return test_summary("test_rules");
 }

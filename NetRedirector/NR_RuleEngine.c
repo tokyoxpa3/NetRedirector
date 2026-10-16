@@ -130,6 +130,36 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
         char dest_str[MAX_IP_STR];
         addr_to_string(family, src_addr, src_str, sizeof(src_str));
         addr_to_string(family, dest_addr, dest_str, sizeof(dest_str));
+
+        // [Added] DNS is the one case where the fallback below does not just
+        // err on the safe side - it contradicts a setting.
+        //
+        // g_dns_via_proxy defaults to TRUE, i.e. "DNS goes through the proxy"
+        // (it is the whole point of the socks5h path: the proxy resolves, so no
+        // cleartext query leaves the machine). An attributed DNS flow reaches
+        // the rules and therefore the proxy whenever a catch-all PROXY rule is
+        // configured. An unattributed one - routine for UDP, the client socket
+        // is usually gone before the table lookup - used to stop here and go
+        // DIRECT. Same setting, two different outcomes, and the leaky half is
+        // invisible: the datagram is forwarded unchanged and looks normal.
+        //
+        // So for port 53 fall through to match_rule() with an empty process
+        // name instead, exactly like the "pid we cannot name" case below: the
+        // rules that can still be evaluated (wildcard, PID, domain) decide, and
+        // name-specific rules simply miss. With g_dns_via_proxy off the
+        // preference wins outright - no rule may put DNS on the proxy.
+        char disposition[160];
+        if (dest_port == 53) {
+            snprintf(disposition, sizeof(disposition), g_dns_via_proxy
+                ? "DNS with dns_via_proxy on, so the rules are evaluated with "
+                  "an empty process name (process-name rules cannot match)"
+                : "applying DIRECT (DNS with dns_via_proxy off)");
+        } else {
+            snprintf(disposition, sizeof(disposition),
+                "applying unknown-process action %d - process-name rules "
+                "cannot match it", (int)g_unknown_process_action);
+        }
+
         // UDP gets its own, much longer window: an unattributable UDP datagram
         // is routine (the socket is usually gone before the lookup - see
         // NR_THROTTLE_UNKNOWN_PID_UDP in NR_Common.h) and it is forwarded
@@ -139,16 +169,23 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
                                      : NR_THROTTLE_UNKNOWN_PID,
             is_udp ? NR_THROTTLE_UNKNOWN_PID_UDP_MS : 5000,
             "Flow %s:%u -> %s:%u (family %d, %s) could not be attributed to a "
-            "process; applying unknown-process action %d - process-name rules "
-            "cannot match it",
+            "process; %s",
             src_str, (unsigned)src_port, dest_str, (unsigned)dest_port,
-            family, is_udp ? "UDP" : "TCP", (int)g_unknown_process_action);
-        *out_proxy_id = 0;
-        return g_unknown_process_action;
-    }
+            family, is_udp ? "UDP" : "TCP", disposition);
 
-    // Loop prevention: bypass own process
-    if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
+        if (dest_port != 53) {
+            *out_proxy_id = 0;
+            return g_unknown_process_action;
+        }
+        if (!g_dns_via_proxy) {
+            *out_proxy_id = 0;
+            return RULE_ACTION_DIRECT;
+        }
+        // DNS with dns_via_proxy on: fall through with an empty process name.
+    } else {
+        // Loop prevention: bypass own process
+        if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
+    }
 
     // [Changed] A pid we cannot name is no longer an automatic DIRECT.
     //
@@ -165,6 +202,9 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
     // If nothing matches, match_rule() returns DIRECT on its own - so the worst
     // case is exactly what it was, while the common case (a catch-all rule) now
     // behaves the way the user configured it.
+    //
+    // pid == 0 also lands here (the DNS case above): the call is a no-op that
+    // returns FALSE for it, leaving the empty name the fall-through wanted.
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name))) {
         process_name[0] = '\0';
     }
