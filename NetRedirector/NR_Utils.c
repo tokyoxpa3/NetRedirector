@@ -710,6 +710,25 @@ void clear_dns_snoop_cache(void)
     LeaveCriticalSection(&lock_pid_cache);
 }
 
+// [Added] TRUE when one hosts-field token is a name that needs DNS resolution.
+//
+// is_ip_like_pattern() answers "is this a dotted-IPv4 octet pattern?", which is
+// the right question for match_ip_pattern() but the wrong one here: an IPv6
+// literal ("2001:db8::1") and an IPv6 CIDR block ("2001:db8::/32") both contain
+// characters that function rejects, so both used to be classified as domains.
+// The consequences were a needless machine-wide DNS resolver flush and two
+// doomed lookups per rule edit (see flush_dns_resolver_cache below) - and for
+// the CIDR form that is a rule a user has every reason to write.
+//
+// A ':' or '/' cannot appear in a hostname, so either one settles it.
+static BOOL is_domain_token(const char *token)
+{
+    if (token == NULL || token[0] == '\0') return FALSE;
+    if (is_wildcard_str(token)) return FALSE;
+    if (strchr(token, ':') != NULL || strchr(token, '/') != NULL) return FALSE;
+    return !is_ip_like_pattern(token);
+}
+
 // [Added] Pre-resolve every domain pattern inside one rule's hosts field
 // ("a.com;8.8.8.8;*.b.com" -> force-resolve a.com and b.com). Called by the
 // background DNS refresher thread only - never from a packet thread. Skips
@@ -727,7 +746,7 @@ void refresh_rule_dns(const char *hosts_field)
     char *token = strtok(copy, ";");
     while (token != NULL) {
         while (*token == ' ' || *token == '\t') token++;
-        if (token[0] != '\0' && !is_wildcard_str(token) && !is_ip_like_pattern(token)) {
+        if (is_domain_token(token)) {
             if (token[0] == '*' && token[1] == '.') token += 2;
             if (token[0] != '\0') {
                 force_resolve_rule_host(token);
@@ -740,12 +759,12 @@ void refresh_rule_dns(const char *hosts_field)
 }
 
 // [Added] TRUE when a rule's hosts field contains at least one DOMAIN token,
-// i.e. a token that is neither a wildcard ("*"/"ANY") nor an IP-octet pattern.
+// i.e. a token that is neither a wildcard ("*"/"ANY") nor an IP pattern.
 // Such rules are the only ones that depend on the DNS-snoop IP->hostname map,
 // which can only be populated by observing a DNS response on the wire - see
 // flush_dns_resolver_cache() below for why that matters.
-// Reuses is_ip_like_pattern() so the notion of "this token is a domain" is
-// identical to the one match_ip_pattern() uses when deciding which lookup to do.
+// Delegates to is_domain_token() so the notion of "this token is a domain" is
+// identical to the one refresh_rule_dns() uses when deciding what to resolve.
 BOOL hosts_field_has_domain(const char *hosts_field)
 {
     if (hosts_field == NULL || hosts_field[0] == '\0') return FALSE;
@@ -760,7 +779,7 @@ BOOL hosts_field_has_domain(const char *hosts_field)
     char *token = strtok(copy, ";");
     while (token != NULL) {
         while (*token == ' ' || *token == '\t') token++;
-        if (token[0] != '\0' && !is_wildcard_str(token) && !is_ip_like_pattern(token)) {
+        if (is_domain_token(token)) {
             has_domain = TRUE;
             break;
         }
@@ -1232,9 +1251,58 @@ BOOL is_lan_or_on_link_address(int family, const UINT8 *addr)
     return FALSE;
 }
 
+// [Added] IPv6 CIDR, e.g. "2001:db8::/32" or "::/0".
+//
+// Before this the IPv6 branch below could only compare against the full
+// address string, so an IPv6 rule could name single hosts and nothing else -
+// and a subnet rule is literally unwritable, since a /64 is 2^64 addresses.
+// (The upstream ProxyBridge has had this since its first release; see
+// docs/proxybridge-borrow-audit.md P2-1.)
+//
+// Deliberately strict: anything malformed (empty address part, empty or
+// non-numeric prefix, prefix > 128, an address InetPtonA rejects) returns
+// FALSE instead of falling through to the string compare. "/32" and
+// "2001:db8::/999" are not addresses, and letting them reach the compare
+// would turn a typo into a rule that silently never matches.
+static BOOL match_ipv6_cidr(const char *pattern, const UINT8 *ip)
+{
+    const char *slash = strchr(pattern, '/');
+    size_t addr_len = (size_t)(slash - pattern);
+    char addr_part[64];
+
+    if (addr_len == 0 || addr_len >= sizeof(addr_part)) return FALSE;
+    memcpy(addr_part, pattern, addr_len);
+    addr_part[addr_len] = '\0';
+
+    const char *len_str = slash + 1;
+    if (len_str[0] == '\0') return FALSE;
+
+    char *end = NULL;
+    long prefix = strtol(len_str, &end, 10);
+    if (end == NULL || *end != '\0' || prefix < 0 || prefix > 128) return FALSE;
+
+    UINT8 ref[16];
+    if (InetPtonA(AF_INET6, addr_part, ref) != 1) return FALSE;
+
+    UINT8 mask[16];
+    prefix_to_mask((UINT8)prefix, mask, 16);
+    for (int i = 0; i < 16; i++) {
+        if ((ip[i] & mask[i]) != (ref[i] & mask[i])) return FALSE;
+    }
+    return TRUE;
+}
+
 BOOL match_ip_pattern6(const char *pattern, const UINT8 *ip)
 {
     if (is_wildcard_str(pattern)) return TRUE;
+
+    // [Added] Checked before the ':' test: a CIDR literal contains ':' too,
+    // and without this it would be compared as an exact address string and
+    // never match. A token with a '/' can only be a CIDR - domain rules have
+    // no '/' either, so nothing that used to work is diverted here.
+    if (strchr(pattern, '/') != NULL) {
+        return match_ipv6_cidr(pattern, ip);
+    }
 
     // A domain rule never contains ':' (IPv6 literals always do).
     if (strchr(pattern, ':') == NULL) {

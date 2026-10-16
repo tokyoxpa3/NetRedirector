@@ -201,7 +201,8 @@ class RuleDialog(QDialog):
         # normalize_rule_pattern 在 get_data() 補回預設值。
         self.ent_hosts = QLineEdit()
         self.ent_hosts.setPlaceholderText(
-            tr.t("IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*"))
+            tr.t("IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*"
+                 ";2001:db8::/32"))
         form.addRow(tr.t("Hosts:"), self.ent_hosts)
 
         self.ent_ports = QLineEdit()
@@ -593,6 +594,15 @@ class RulesTabMixin(AutoSaveMixin):
             return
         if rule_data.get('enabled', True) and rule_data.get('id'):
             self.bridge.delete_rule(int(rule_data['id']))
+        # 自動加入的規則被刪除時，一併移出 auto_direct 清單；否則下次啟動
+        # 掃描會把它又加回來，使用者會覺得刪不掉
+        if rule_data.get('auto') and hasattr(self, 'auto_direct'):
+            target = str(rule_data.get('target', '')).lower()
+            self.auto_direct = [
+                t for t in self.auto_direct if t.lower() != target]
+            self.append_log(
+                f"已停止自動加入 {rule_data.get('target')} 的直連"
+                f"（該程式下次啟動時會重新註冊）")
         self.rules = [r for r in self.rules if r is not rule_data]
         self.refresh_rules_table()
         self._request_save()
@@ -619,7 +629,9 @@ class RulesTabMixin(AutoSaveMixin):
             self.table_rules.setCellWidget(row, 0, wrap)
 
             self.table_rules.setItem(row, 1, QTableWidgetItem(r['type']))
-            self.table_rules.setItem(row, 2, QTableWidgetItem(r['target']))
+            # 由本機控制 API 自動加入的規則加上標記，避免使用者誤解來源
+            target_text = r['target'] + (self.t(" (自動)") if r.get('auto') else "")
+            self.table_rules.setItem(row, 2, QTableWidgetItem(target_text))
             self.table_rules.setItem(row, 3, QTableWidgetItem(r.get('hosts', '*')))
             self.table_rules.setItem(row, 4, QTableWidgetItem(r.get('ports', '*')))
             self.table_rules.setItem(row, 5, QTableWidgetItem(r.get('proto', 'BOTH')))

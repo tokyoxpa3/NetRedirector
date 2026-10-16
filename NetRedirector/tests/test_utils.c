@@ -91,6 +91,41 @@ int main(void)
     CHECK(match_port_list("80,443", 443) == TRUE, "port list match");
     CHECK(match_port_list("80,443", 8080) == FALSE, "port list miss");
 
+    printf("== match_ip_pattern6 (IPv6 CIDR) ==\n");
+    {
+        // 2001:db8::1, 2001:db9::1, 2001:db8:1234::1 - network byte order.
+        UINT8 a_db8[16]      = {0x20,0x01,0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1};
+        UINT8 a_db8_zero[16] = {0x20,0x01,0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+        UINT8 a_db9[16]      = {0x20,0x01,0x0d,0xb9, 0,0,0,0, 0,0,0,0, 0,0,0,1};
+        UINT8 a_db8_1234[16] = {0x20,0x01,0x0d,0xb8, 0x12,0x34,0,0, 0,0,0,0, 0,0,0,1};
+
+        CHECK(match_ip_pattern6("2001:db8::/32", a_db8) == TRUE, "/32 covers its own prefix");
+        CHECK(match_ip_pattern6("2001:db8::/32", a_db9) == FALSE, "/32 does not cover the next /32");
+        CHECK(match_ip_pattern6("2001:db8::/32", a_db8_1234) == TRUE, "/32 covers a deeper subnet");
+        CHECK(match_ip_pattern6("2001:db8:1234::/48", a_db8_1234) == TRUE, "/48 matches");
+        CHECK(match_ip_pattern6("2001:db8::/48", a_db8_1234) == FALSE, "/48 miss on bits 32-47");
+        CHECK(match_ip_pattern6("2001:db8::/128", a_db8_zero) == TRUE, "/128 behaves as an exact match");
+        CHECK(match_ip_pattern6("2001:db8::/128", a_db8) == FALSE, "/128 miss on the last bit");
+        CHECK(match_ip_pattern6("::/0", a_db9) == TRUE, "/0 matches everything");
+        CHECK(match_ip_pattern6("2001:db8::1", a_db8) == TRUE, "exact address still works");
+        CHECK(match_ip_pattern6("2001:db8::1", a_db9) == FALSE, "exact address still rejects");
+
+        // Malformed CIDR must not fall through to the string compare: a typo
+        // has to be a non-match, not a rule that silently matches nothing.
+        CHECK(match_ip_pattern6("2001:db8::/129", a_db8) == FALSE, "prefix > 128 -> FALSE");
+        CHECK(match_ip_pattern6("2001:db8::/", a_db8) == FALSE, "empty prefix -> FALSE");
+        CHECK(match_ip_pattern6("2001:db8::/abc", a_db8) == FALSE, "non-numeric prefix -> FALSE");
+        CHECK(match_ip_pattern6("/32", a_db8) == FALSE, "empty address -> FALSE");
+        CHECK(match_ip_pattern6("nope/32", a_db8) == FALSE, "unparsable address -> FALSE");
+        CHECK(match_ip_pattern6("2001:db8::/32/32", a_db8) == FALSE, "two slashes -> FALSE");
+
+        CHECK(match_ip_list6("2001:db8::/32;2001:db9::/32", a_db9) == TRUE, "list second CIDR matches");
+        CHECK(match_ip_list6("2001:db8::/32", a_db9) == FALSE, "list CIDR miss");
+        CHECK(match_ip_list6("2001:db8::/32", a_db8) == TRUE, "list CIDR match");
+        CHECK(match_ip_pattern6("*", a_db9) == TRUE, "wildcard still wins");
+        CHECK(match_ip_pattern6("ANY", a_db9) == TRUE, "'ANY' still wins");
+    }
+
     printf("== match_process_pattern ==\n");
     CHECK(match_process_pattern("*", "C:\\x\\firefox.exe") == TRUE, "'*' matches any");
     CHECK(match_process_pattern("fire*", "firefox.exe") == TRUE, "suffix wildcard");
@@ -117,6 +152,10 @@ int main(void)
     CHECK(hosts_field_has_domain("8.8.8.8;example.com") == TRUE, "mixed list with a domain");
     CHECK(hosts_field_has_domain("8.8.8.8;1.1.1.1") == FALSE, "IP-only list");
     CHECK(hosts_field_has_domain("192.168.*.*") == FALSE, "IP octet wildcard is not a domain");
+    CHECK(hosts_field_has_domain("2001:db8::1") == FALSE, "IPv6 literal is not a domain");
+    CHECK(hosts_field_has_domain("2001:db8::/32") == FALSE, "IPv6 CIDR is not a domain");
+    CHECK(hosts_field_has_domain("8.8.8.8;2001:db8::/32") == FALSE, "IPv4 + IPv6 CIDR list is not a domain");
+    CHECK(hosts_field_has_domain("2001:db8::/32;example.com") == TRUE, "CIDR + domain list still has a domain");
     CHECK(hosts_field_has_domain("*") == FALSE, "'*' is not a domain");
     CHECK(hosts_field_has_domain("ANY") == FALSE, "'ANY' is not a domain");
     CHECK(hosts_field_has_domain("") == FALSE, "empty");

@@ -26,7 +26,7 @@
     "新增攔截規則": "Onderscheppingsregel toevoegen",
     "例如: chrome.*;Game*.exe ，或 PID 1234 (留空 * = 全部進程)": "bijv. chrome.*;Game*.exe of PID 1234 (leeg * = alle processen)",
     "目標:": "Doel:",
-    "IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*": "IP/domein (standaard *) bijv. 8.8.8.8;*.google.com;192.168.*.*",
+    "IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*;2001:db8::/32": "IP/domein (standaard *) bijv. 8.8.8.8;*.google.com;192.168.*.*;2001:db8::/32",
     "Port (預設 *) 例: 443;1000-2000": "Poort (standaard *) bijv. 443;1000-2000",
     "PROXY (轉發)": "PROXY (doorsturen)",
     "DIRECT (直連)": "DIRECT (rechtstreeks)",

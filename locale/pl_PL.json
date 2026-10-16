@@ -26,7 +26,7 @@
     "新增攔截規則": "Dodaj regułę przechwytywania",
     "例如: chrome.*;Game*.exe ，或 PID 1234 (留空 * = 全部進程)": "np. chrome.*;Game*.exe lub PID 1234 (puste * = wszystkie procesy)",
     "目標:": "Cel:",
-    "IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*": "IP/domena (domyślne *) np. 8.8.8.8;*.google.com;192.168.*.*",
+    "IP/域名 (預設 *) 例: 8.8.8.8;*.google.com;192.168.*.*;2001:db8::/32": "IP/domena (domyślne *) np. 8.8.8.8;*.google.com;192.168.*.*;2001:db8::/32",
     "Port (預設 *) 例: 443;1000-2000": "Port (domyślny *) np. 443;1000-2000",
     "PROXY (轉發)": "PROXY (przekieruj)",
     "DIRECT (直連)": "DIRECT (bezpośrednio)",
