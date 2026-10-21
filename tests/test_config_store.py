@@ -221,3 +221,47 @@ def test_manage_metric_default_and_roundtrip(tmp_path):
     assert config_store.save_config_file(path, data_off) is None
     assert config_store.load_config_file(path)["manage_metric"] is False
 
+
+def test_auto_direct_default_and_roundtrip(tmp_path):
+    """auto_direct 未提供時序列化為空清單，提供時原樣保留。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules)
+    assert data["auto_direct"] == []
+
+    data2 = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules,
+        auto_direct=["MultiSocksDownloader.exe"])
+    assert data2["auto_direct"] == ["MultiSocksDownloader.exe"]
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data2) is None
+    assert config_store.load_config_file(path)["auto_direct"] == [
+        "MultiSocksDownloader.exe"]
+
+
+def test_rule_auto_flag_persisted():
+    """規則的 auto 標記要持久化；舊規則無此欄位時視為 False。"""
+    proxies, rules = sample_state()
+    rules[0]["auto"] = True
+    data = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules)
+    assert data["rules"][0]["auto"] is True
+    assert data["rules"][1]["auto"] is False
+
+
+def test_auto_direct_enabled_default_and_roundtrip(tmp_path):
+    """auto_direct_enabled 預設開啟，可關閉，且序列化往返保留。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules)
+    assert data["auto_direct_enabled"] is True
+
+    data_off = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules,
+        auto_direct=["X.exe"], auto_direct_enabled=False)
+    assert data_off["auto_direct_enabled"] is False
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data_off) is None
+    assert config_store.load_config_file(path)["auto_direct_enabled"] is False

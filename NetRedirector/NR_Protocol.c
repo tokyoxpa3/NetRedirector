@@ -296,6 +296,11 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     assoc->relay_addr = relay_addr;
     assoc->last_activity = GetTickCount();
     assoc->send_fail_streak = 0;
+    // Silence tracking starts at establish time: a relay that never forwards
+    // must still be re-dialed eventually (see UDP_ASSOC_RX_SILENCE_MS).
+    assoc->last_rx = assoc->last_activity;
+    assoc->tx_since_rx = 0;
+    assoc->rx_seen = FALSE;
     assoc->next = NULL;
 
     log_message("UDP ASSOCIATE established with SOCKS5 proxy ID %u (%s:%d)", assoc->proxy_id, proxy_config->proxy_ip, proxy_config->proxy_port);

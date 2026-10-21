@@ -11,7 +11,8 @@ import secure_config
 
 
 def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies, rules,
-                      check_updates=True, autostart=True, manage_metric=True):
+                      check_updates=True, autostart=True, manage_metric=True,
+                      auto_direct=None, auto_direct_enabled=True):
     """把執行期狀態序列化為 config.json 結構。
 
     - Proxy: 移除動態數據 (latency/ID)，密碼以 DPAPI 加密
@@ -22,6 +23,10 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
       此欄位只記錄使用者偏好，預設開啟。缺少此欄位的舊設定檔視為預設開啟。
     - manage_metric: 是否自動校正網路介面計量 (避免 SoftEther 虛擬網卡
       搶走預設路由)。缺少此欄位的舊設定檔視為預設開啟。
+    - auto_direct: 啟動時要主動確保為直連的進程名清單 (例如自家下載器)。
+      None 代表「呼叫端未提供」，交由還原端帶入預設值；明確的 [] 則代表
+      使用者已把清單清空，須原樣保存。
+    - auto_direct_enabled: 是否啟用上述自動直連偵測 (齒輪選單的開關)。
     """
     config_data = {
         "lang": lang,
@@ -30,6 +35,8 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
         "check_updates": bool(check_updates),
         "autostart": bool(autostart),
         "manage_metric": bool(manage_metric),
+        "auto_direct": list(auto_direct) if auto_direct else [],
+        "auto_direct_enabled": bool(auto_direct_enabled),
         "hubs": hubs or {},
         "proxies": [],
         "rules": [],
@@ -65,6 +72,9 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
             # 穩定識別 (自訂代理名稱或 Hub 端口字串):還原時優先以此反查,
             # 不受顯示文字翻譯/改版影響;舊版設定檔無此欄位時回退 proxy_text
             "proxy_name": r.get('proxy_name', ''),
+            # 由本機控制 API 自動加入的規則標記:保留才能在使用者刪除時
+            # 一併把它移出 auto_direct 清單,避免下次啟動又被加回來
+            "auto": bool(r.get('auto', False)),
         })
 
     return config_data

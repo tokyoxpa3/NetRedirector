@@ -85,6 +85,30 @@
 // the TCP control socket reaches EOF and the relay walk drops it.
 #define UDP_ASSOC_SEND_FAIL_MAX 100
 
+// Association liveness: a SOCKS5 UDP relay port dies SILENTLY.
+//
+// The proxy's BND.ADDR:BND.PORT is only as long-lived as the NAT mapping
+// behind it. A phone hotspot that changes cell towers (or a carrier whose UDP
+// NAT entry expires) stops forwarding on that port while the TCP control
+// connection stays ESTABLISHED on keepalive - so select() never reports EOF
+// and sendto() never fails, because UDP is connectionless. The association
+// then black-holes every datagram for hours: measured on the dev machine, one
+// established at 17:04 was still being used at 09:11 the next morning with
+// zero replies, which surfaced as "Discord RTC -> no route" (every STUN
+// binding request and every media packet went into the hole).
+//
+// The only observable signal is silence: we keep sending and nothing comes
+// back. Drop the association after this much silence and the next datagram
+// re-dials it, exactly like the sendto-failure path above.
+//
+// The counters are per association, and the "never replied" case gets a much
+// wider window: a genuinely one-way flow (syslog, a fire-and-forget heartbeat)
+// would otherwise be re-dialed every 15 seconds for no benefit.
+#define UDP_ASSOC_RX_SILENCE_MS 15000
+#define UDP_ASSOC_RX_SILENCE_DATAGRAMS 20
+#define UDP_ASSOC_RX_SILENCE_MS_ONEWAY 60000
+#define UDP_ASSOC_RX_SILENCE_DATAGRAMS_ONEWAY 200
+
 // Max text length of an IP address (IPv6: 45 chars + null)
 #define MAX_IP_STR 48
 
@@ -157,6 +181,12 @@ typedef struct UDP_ASSOCIATION {
     struct sockaddr_in relay_addr;
     DWORD last_activity;
     DWORD send_fail_streak;   // consecutive failed sendto()s to the proxy relay
+    // [Added] Reply-silence tracking (see UDP_ASSOC_RX_SILENCE_MS). last_rx is
+    // the establish time until the first reply arrives, so a relay that never
+    // worked is still eventually re-dialed - just on the wider one-way window.
+    DWORD last_rx;            // GetTickCount() of the last valid reply
+    UINT32 tx_since_rx;       // datagrams sent since that reply
+    BOOL rx_seen;             // TRUE once at least one reply has been observed
     struct UDP_ASSOCIATION *next;
 } UDP_ASSOCIATION;
 

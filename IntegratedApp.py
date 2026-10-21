@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
                              QSystemTrayIcon, QCheckBox, QFrame, QWidgetAction,
                              QProgressDialog)
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread, QPoint
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread, QPoint, QObject
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
 from i18n import i18n as tr, SUPPORTED_LANGS
@@ -28,6 +28,8 @@ import proxy_core
 import secure_config  # [新增] 密碼 DPAPI 加密儲存
 import rule_utils  # [模組化] 規則欄位處理 (全形星號正規化等)
 import config_store  # [模組化] 設定序列化與檔案 I/O
+import process_utils  # [本機控制 API] 列舉執行中進程，供 auto_direct 啟動掃描
+import control_api  # [本機控制 API] 讓自家工具查詢/請求直連規則
 from autosave import SaveScheduler  # [自動存檔] 變更即存 + 關機前強制落地
 import interface_metrics  # [介面計量] SoftEther 虛擬網卡 vs 實體網卡計量校正
 from app_helpers import (  # [模組化] GUI 輔助元件 (自本檔抽出)
@@ -52,6 +54,16 @@ def _fmt_bytes(n):
             return ("{:.0f} {}" if unit == "B" else "{:.1f} {}").format(value, unit)
         value /= 1024
     return "{:.1f} TB".format(value)
+
+
+class UiDispatch(QObject):
+    """把背景執行緒的呼叫排回 UI 執行緒執行 (本機控制 API 用)。
+
+    規則的讀寫都必須在 UI 執行緒 (Qt 物件與 DLL 呼叫皆非執行緒安全)，而
+    控制 API 的請求由背景執行緒處理，因此需要這條跨執行緒通道：emit 之後
+    由 receiver 所在執行緒 (UI) 執行實際動作。
+    """
+    run = Signal(object)  # 傳入 callable，於 UI 執行緒執行
 
 
 class UpdateWorker(QThread):
@@ -153,6 +165,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.hub_proxy_map = {}    # Hub Port -> Proxy ID
         self.custom_proxies = []   # List of dict: Manual Proxies
         self.rules = []            # Rules list
+        # [本機控制 API] 啟動時要主動確保為直連的自家程式進程名清單；
+        # 舊設定檔無此欄位時於還原階段帶入預設值 (見 _apply_loaded_config)
+        self.auto_direct = list(control_api.DEFAULT_AUTO_DIRECT)
+        # 齒輪選單的「自動偵測並加入直連程式」開關；關閉則啟動掃描不執行
+        self.auto_direct_enabled = True
+        self.control_api = None    # 本機控制 API server (於 __init__ 尾端啟動)
         self.current_interfaces = {}
         self.selected_hub_port = None
         self.is_redirector_running = False
@@ -204,6 +222,24 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         self.update_proxy_table_signal.connect(self.refresh_custom_proxy_table)
         self.metric_sync_done.connect(self._on_metric_sync_done)
+
+        # [本機控制 API] 跨執行緒把請求排回 UI 執行緒 (規則讀寫必須在此)。
+        # 連線必須在 API server 啟動前建立，否則第一筆請求可能落空。
+        self._ui_dispatch = UiDispatch()
+        self._ui_dispatch.run.connect(self._run_on_ui)
+
+        # [本機控制 API] 只綁 127.0.0.1，供自家工具查詢/請求直連規則。
+        # 埠被占用時 start() 回 False，只記一筆訊息，不影響主程式。
+        self.control_api = control_api.ControlApiServer(
+            dispatch=self._call_on_ui,
+            ping_fn=self._api_ping,
+            list_rules_fn=self._api_list_rules,
+            ensure_direct_fn=self._api_ensure_direct,
+            token=control_api.load_or_create_token(),
+        )
+        if self.control_api.start():
+            self.append_log(
+                f"本機控制 API 已啟動 (127.0.0.1:{self.control_api.actual_port})")
 
         # [新增] 載入設定
         QTimer.singleShot(100, self.load_config)
@@ -377,6 +413,190 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         """偏好勾選項變更：排程寫入設定 (autostart 另有即時存檔)。"""
         self._request_save()
 
+    # --------------------------------------------------------- 本機控制 API
+    def _run_on_ui(self, fn):
+        """UiDispatch.run 的接收端：在 UI 執行緒執行 fn。"""
+        fn()
+
+    def _call_on_ui(self, fn, timeout=5.0):
+        """在 UI 執行緒執行 fn 並等待結果 (供控制 API 的背景執行緒呼叫)。
+
+        規則讀寫與 DLL 呼叫都必須在 UI 執行緒，故以 signal 排入：emit 在
+        背景執行緒、receiver 在 UI 執行緒，Qt 會自動以 queued 方式投遞。
+        """
+        if QThread.currentThread() is self.thread():
+            return fn()  # 已在 UI 執行緒，直接執行，省去往返
+
+        box = {}
+        done = threading.Event()
+
+        def wrapper():
+            try:
+                box['value'] = fn()
+            except Exception as e:  # noqa: BLE001 — 原樣轉回呼叫端處理
+                box['error'] = e
+            finally:
+                done.set()
+
+        self._ui_dispatch.run.emit(wrapper)
+        if not done.wait(timeout):
+            raise TimeoutError("UI 執行緒無回應")
+        if 'error' in box:
+            raise box['error']
+        return box.get('value')
+
+    def _api_ping(self):
+        """GET /ping：回傳版本與執行狀態。"""
+        return {
+            "app": "NetRedirector",
+            "version": APP_VERSION,
+            "pid": os.getpid(),
+            "running": bool(self.is_redirector_running),
+        }
+
+    def _api_list_rules(self, target=None):
+        """GET /rules：列出規則 (可依進程名過濾)。"""
+        want = (target or "").strip().lower()
+        result = []
+        for r in self.rules:
+            if want and str(r.get('target', '')).lower() != want:
+                continue
+            result.append({
+                "id": int(r.get('id') or 0),
+                "enabled": bool(r.get('enabled', True)),
+                "type": r.get('type', 'Name'),
+                "target": r.get('target', ''),
+                "hosts": r.get('hosts', '*'),
+                "ports": r.get('ports', '*'),
+                "proto": r.get('proto', 'BOTH'),
+                "action_key": self._rule_action_idx(r),
+                "auto": bool(r.get('auto', False)),
+            })
+        return result
+
+    def _has_enabled_direct_rule(self, target):
+        """回傳指向 target 且啟用中的 DIRECT 名稱規則；沒有則回 None。"""
+        want = target.lower()
+        for r in self.rules:
+            if (r.get('enabled', True)
+                    and r.get('type') == 'Name'
+                    and str(r.get('target', '')).lower() == want
+                    and self._rule_action_idx(r) == 1):
+                return r
+        return None
+
+    def _add_auto_direct_rule(self, target):
+        """新增一條自動直連規則。呼叫端須先確認尚無同名規則。
+
+        回傳新增的 rule dict；DLL 拒絕時回 None。
+        """
+        rid = self.bridge.add_rule_ex('Name', target, '*', '*', 'BOTH', 1, 0)
+        if rid <= 0:
+            self.append_log(f"自動直連規則新增失敗 (目標: {target})")
+            return None
+        rule = {
+            'id': int(rid),
+            'enabled': True,
+            'type': 'Name',
+            'target': target,
+            'hosts': '*',
+            'ports': '*',
+            'proto': 'BOTH',
+            'action': self.t("DIRECT (直連)"),
+            'action_key': 1,
+            'proxy': self.t("未指定 (Fallback to Direct)"),
+            'proxy_name': '',
+            'proxy_id': 0,
+            'auto': True,
+        }
+        self.rules.append(rule)
+        return rule
+
+    def _remember_auto_direct(self, target):
+        """把 target 記進 auto_direct 清單 (不分大小寫去重)，讓下次啟動也照顧。"""
+        if target.lower() not in [t.lower() for t in self.auto_direct]:
+            self.auto_direct.append(target)
+
+    def _api_ensure_direct(self, target):
+        """POST /ensure-direct：確保 target 有啟用中的 DIRECT 規則。
+
+        冪等：已有啟用中的 DIRECT 名稱規則就直接回報，不重複新增 ——
+        C 核心的 AddRule 不去重，重複呼叫會堆出多條相同規則。
+        """
+        target = (target or "").strip()
+        if not target:
+            return {"added": False, "error": "missing target"}
+        if control_api.is_generic_interpreter(target):
+            # 通用直譯器 (python.exe 等) 直連會波及所有同類程式，包含 NR 自己。
+            # 仍允許 (呼叫端可能刻意如此，例如開發模式跑原始碼)，只記一筆提示。
+            self.append_log(
+                f"注意：{target} 為通用直譯器名稱，設為直連會讓所有 Python "
+                f"程式一起直連")
+
+        existing = self._has_enabled_direct_rule(target)
+        if existing is not None:
+            self._remember_auto_direct(target)
+            self._request_save()
+            return {"added": False, "existed": True,
+                    "rule_id": int(existing.get('id') or 0)}
+
+        rule = self._add_auto_direct_rule(target)
+        if rule is None:
+            return {"added": False, "error": "driver rejected rule"}
+
+        self._remember_auto_direct(target)
+        self.refresh_rules_table()
+        self._request_save()
+        self.append_log(f"已自動為 {target} 加入直連規則 (ID: {rule['id']})")
+        return {"added": True, "existed": False, "rule_id": rule['id']}
+
+    def _scan_auto_direct_targets(self):
+        """啟動後掃描一次 auto_direct：為正在執行、且尚無任何規則的目標進程
+        補上直連規則。
+
+        只在「該進程正在執行」且「使用者尚未為它建立任何規則 (含停用)」時
+        才動作。後者是為了尊重使用者的停用/自訂意圖，避免每次啟動都把被
+        停用的規則又加回來。
+        """
+        if not self.auto_direct or not self.auto_direct_enabled:
+            return
+        try:
+            running = {n.lower() for n in process_utils.list_process_names()}
+        except Exception:  # noqa: BLE001 — 列舉失敗只代表這次不掃，不影響主流程
+            return
+        existing = {str(r.get('target', '')).lower() for r in self.rules}
+        added = False
+        for target in list(self.auto_direct):
+            key = target.lower()
+            if key not in running or key in existing:
+                continue
+            if control_api.is_generic_interpreter(target):
+                # 使用者若把 python.exe 之類放進清單，仍照做，只提示副作用
+                self.append_log(
+                    f"注意：{target} 為通用直譯器名稱，設為直連會讓所有 Python "
+                    f"程式一起直連")
+            rule = self._add_auto_direct_rule(target)
+            if rule is not None:
+                added = True
+                self.append_log(
+                    f"偵測到 {target} 正在執行，已自動加入直連規則 (ID: {rule['id']})")
+        if added:
+            self.refresh_rules_table()
+            self._request_save()
+
+    def on_auto_direct_toggled(self, checked):
+        """齒輪選單的「自動偵測並加入直連程式」開關。
+
+        關閉：啟動掃描不再執行。開啟：把預設清單的項目補回並立即掃描一次
+        —— 這是使用者刪除自動規則後，讓自動偵測回來的入口。
+        """
+        self.auto_direct_enabled = bool(checked)
+        if checked:
+            for name in control_api.DEFAULT_AUTO_DIRECT:
+                self._remember_auto_direct(name)
+            self._scan_auto_direct_targets()
+        self._request_save()
+
     # [模組化] 儲存設定 (序列化/檔案 I/O 移至 config_store)
     def save_config(self, quiet=False):
         """把目前狀態寫入 config.json。
@@ -390,7 +610,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.port_config, self.custom_proxies, self.rules,
             self.chk_check_updates.isChecked() if hasattr(self, 'chk_check_updates') else True,
             self.chk_autostart.isChecked() if hasattr(self, 'chk_autostart') else True,
-            self.chk_manage_metric.isChecked() if hasattr(self, 'chk_manage_metric') else True)
+            (self.chk_manage_metric.isChecked()
+             if hasattr(self, 'chk_manage_metric') else True),
+            self.auto_direct, self.auto_direct_enabled)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
             if not quiet:
@@ -410,6 +632,10 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self._apply_loaded_config()
         finally:
             self._loading_config = False
+        # [本機控制 API] 設定載入完成後掃描一次 auto_direct：當 NR 比目標
+        # 程式晚啟動時，靠這一步補上直連規則 (目標程式較晚啟動時，則由它
+        # 自己呼叫 API 請求，兩者互補即可涵蓋誰先誰後，且不需持續輪詢)。
+        QTimer.singleShot(0, self._scan_auto_direct_targets)
 
     def _apply_loaded_config(self):
         # [Fixed] 先記錄檔案是否存在: 讀取前存在但解析失敗 → 這次真的氈損
@@ -438,6 +664,21 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 self.monitor_thread.set_ping_target(saved_ping)
                 if hasattr(self, 'ent_ping_target'):
                     self.ent_ping_target.setText(saved_ping)
+
+            # [本機控制 API] 還原 auto_direct。舊設定檔沒有此欄位 (None) 時
+            # 保留預設清單；明確的空清單代表使用者已清空，須原樣採用。
+            saved_auto_direct = data.get("auto_direct")
+            if saved_auto_direct is not None:
+                self.auto_direct = [
+                    str(t).strip() for t in saved_auto_direct
+                    if str(t).strip()]
+            self.auto_direct_enabled = bool(
+                data.get("auto_direct_enabled", True))
+            if hasattr(self, "chk_auto_direct"):
+                # blockSignals：還原狀態不該觸發 on_auto_direct_toggled 而掃描
+                self.chk_auto_direct.blockSignals(True)
+                self.chk_auto_direct.setChecked(self.auto_direct_enabled)
+                self.chk_auto_direct.blockSignals(False)
 
             # 還原「關閉時縮到系統匣」
             if hasattr(self, 'chk_minimize_to_tray'):
@@ -547,7 +788,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                         'action_key': action_key,
                         'proxy': proxy_text,   # 顯示文字 (可能隨語系變動)
                         'proxy_name': pending['proxy_name'],  # 穩定識別 (持久化用)
-                        'proxy_id': int(proxy_id)   # [Fixed] 最後已知 ID (刪代理重刷用)
+                        'proxy_id': int(proxy_id),   # [Fixed] 最後已知 ID (刪代理重刷用)
+                        'auto': bool(r.get('auto', False)),  # [控制 API] 自動加入標記
                     })
 
             self.refresh_rules_table()
@@ -837,7 +1079,26 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
     # --------------------------------------------------------- 自動更新
     def _setup_overflow_menu(self):
-        """把「檢查更新 / 關於」併入右上角「⚙」選單 (不再使用獨立選單列)。"""
+        """把「自動直連偵測 / 檢查更新 / 關於」併入右上角「⚙」選單。"""
+        # 自動直連偵測開關：關閉後不再自動加入；重新開啟會把預設清單的項目
+        # 補回並立即掃描一次，作為使用者刪除自動規則後的復原入口。
+        # 這裡用 QCheckBox 包 QWidgetAction，而不是可勾選的 QAction：QAction 的
+        # 勾勾由 Qt 原生 QMenu::indicator 繪製，在深色主題下只會是一個沒有方框
+        # 的白勾，跟上方設定列的 QCheckBox 指示器對不齊。沿用同一種列才一致。
+        self.chk_auto_direct = QCheckBox("")
+        self._reg("text", self.chk_auto_direct, "自動偵測並加入直連程式")
+        self.chk_auto_direct.setChecked(
+            bool(getattr(self, "auto_direct_enabled", True)))
+        self.chk_auto_direct.toggled.connect(self.on_auto_direct_toggled)
+        auto_row = QWidget()
+        auto_row_layout = QHBoxLayout(auto_row)
+        auto_row_layout.setContentsMargins(10, 6, 12, 6)
+        auto_row_layout.addWidget(self.chk_auto_direct)
+        auto_row_layout.addStretch()
+        auto_action = QWidgetAction(self.menu_overflow)
+        auto_action.setDefaultWidget(auto_row)
+        self.menu_overflow.addAction(auto_action)
+
         self.menu_overflow.addSeparator()
 
         self.act_check_update = self.menu_overflow.addAction(self.t("檢查更新"))
@@ -1025,6 +1286,10 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         if getattr(self, '_shutdown_done', False):
             return
         self._shutdown_done = True
+
+        # 先關本機控制 API：關閉流程中不該再接受外部請求進來改規則
+        if getattr(self, 'control_api', None) is not None:
+            self.control_api.stop()
 
         # [診斷] 逐段計時寫入 shutdown_timing.log，定位關閉慢的步驟
         marks = []

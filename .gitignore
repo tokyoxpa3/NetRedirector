@@ -61,3 +61,19 @@ apply_update.ps1
 # 自動更新的日誌檔 (更新時寫入,屬執行期產物)
 update_apply.log
 update_apply_err.log
+
+# 引擎執行期日誌 (由 DLL 寫在執行檔旁邊)
+NetRedirector.engine.log
+NetRedirector.engine.log.*
+
+# 量測腳本的暫存輸出
+.pingtl.txt
+
+# AI 助手與量測腳本的工作目錄 (含沙箱建置產物、探針與分析稿)
+.workbuddy-ai/
+
+# 實驗性 UI 腳本 (未定案,不進版控)
+.fluent_*.py
+
+# 打包好的發佈壓縮檔 (與 releases/ 同性質)
+/IntegratedApp.dist.rar

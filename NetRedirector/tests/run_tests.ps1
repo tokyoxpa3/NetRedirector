@@ -52,7 +52,9 @@ foreach ($tf in $testFiles) {
     $batContent = "@echo off`r`n"
     $batContent += "CALL `"$vcvars`" >nul 2>&1`r`n"   # 必須 CALL, 否則 cl 不會執行
     $batContent += "cd /d `"$DllDir`"`r`n"
-    $batContent += "cl /nologo /DNETREDIRECTOR_EXPORTS tests\$base.c $($dllSrc -join ' ') /Fe:tests\$base.exe /I. /Itests $libs"
+    # /utf-8: 原始檔為 UTF-8, 但 cl 預設依系統字碼頁 (此機器為 950) 解讀,
+    # 註解中的中文只會產生 C4819 警告, 字串常值中的中文則會直接編譯失敗。
+    $batContent += "cl /nologo /utf-8 /DNETREDIRECTOR_EXPORTS tests\$base.c $($dllSrc -join ' ') /Fe:tests\$base.exe /I. /Itests $libs"
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
     Write-Host "`n=== 編譯 $base ===" -ForegroundColor Cyan

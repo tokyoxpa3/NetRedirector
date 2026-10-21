@@ -71,6 +71,28 @@ BOOL udp_reply_source(int family,
     return FALSE;
 }
 
+// [Pure, host-testable] Has this association gone quiet for long enough that
+// its SOCKS5 relay port must be presumed dead?
+//
+// Two windows, because "no reply yet" and "replies stopped" mean different
+// things. An association that has answered before is a two-way flow: if it
+// sends 20+ datagrams and hears nothing for 15 s, the mapping is gone. One
+// that has NEVER answered may simply be one-way traffic, so it gets 200
+// datagrams / 60 s before the (comparatively expensive) re-dial.
+//
+// DWORD subtraction wraps correctly across the 49.7-day GetTickCount() rollover,
+// which is why the elapsed time is computed as an unsigned difference.
+BOOL udp_assoc_is_silent(const UDP_ASSOCIATION *assoc, DWORD now)
+{
+    if (assoc == NULL) return FALSE;
+    if (assoc->rx_seen) {
+        return assoc->tx_since_rx >= UDP_ASSOC_RX_SILENCE_DATAGRAMS &&
+               (DWORD)(now - assoc->last_rx) > UDP_ASSOC_RX_SILENCE_MS;
+    }
+    return assoc->tx_since_rx >= UDP_ASSOC_RX_SILENCE_DATAGRAMS_ONEWAY &&
+           (DWORD)(now - assoc->last_rx) > UDP_ASSOC_RX_SILENCE_MS_ONEWAY;
+}
+
 // [Added] Per-packet NAT/rule processing, extracted verbatim from the old
 // packet_processor loop body (the `continue`s became `return`s). Runs on a
 // flow worker thread - or inline on the receiver when its queue is full.
@@ -1325,6 +1347,18 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         }
                     }
 
+                    // [Added] Drop a silent association BEFORE handing it this
+                    // datagram: the relay port dies without any socket error, so
+                    // silence is the only signal (see UDP_ASSOC_RX_SILENCE_MS).
+                    // Dropping frees the pointer, so it must not be used below.
+                    if (target_assoc != NULL && udp_assoc_is_silent(target_assoc, GetTickCount())) {
+                        log_message("UDP relay: no reply for %lu ms after %lu datagrams - dropping association (proxy id %u) so the next datagram re-dials it",
+                            (unsigned long)(GetTickCount() - target_assoc->last_rx),
+                            (unsigned long)target_assoc->tx_since_rx, proxy_id);
+                        udp_assoc_drop(proxy_id);
+                        target_assoc = NULL;
+                    }
+
                     if (target_assoc) {
                         send_buf[0]=0; send_buf[1]=0; send_buf[2]=0; send_buf[3]=SOCKS5_ATYP_IPV4;
                         memcpy(&send_buf[4], dest_addr, 4);
@@ -1349,6 +1383,10 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         } else {
                             target_assoc->send_fail_streak = 0;
                             target_assoc->last_activity = GetTickCount();
+                            // Sent, but possibly into a dead relay port - the
+                            // silence check above needs this to know how much
+                            // traffic has gone unanswered.
+                            target_assoc->tx_since_rx++;
                         }
                     }
                 }
@@ -1401,6 +1439,16 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         }
                     }
 
+                    // See the IPv4 branch above: silence is the only signal that
+                    // a SOCKS5 UDP relay port has stopped forwarding.
+                    if (target_assoc != NULL && udp_assoc_is_silent(target_assoc, GetTickCount())) {
+                        log_message("UDP relay: no reply for %lu ms after %lu datagrams (IPv6) - dropping association (proxy id %u) so the next datagram re-dials it",
+                            (unsigned long)(GetTickCount() - target_assoc->last_rx),
+                            (unsigned long)target_assoc->tx_since_rx, proxy_id);
+                        udp_assoc_drop(proxy_id);
+                        target_assoc = NULL;
+                    }
+
                     if (target_assoc) {
                         send_buf[0]=0; send_buf[1]=0; send_buf[2]=0; send_buf[3]=SOCKS5_ATYP_IPV6;
                         memcpy(&send_buf[4], dest_addr, 16);
@@ -1421,6 +1469,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         } else {
                             target_assoc->send_fail_streak = 0;
                             target_assoc->last_activity = GetTickCount();
+                            target_assoc->tx_since_rx++;
                         }
                     }
                 }
@@ -1452,6 +1501,12 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 if (recv_len <= 0) break;
                 if (recv_len > 10 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV4) {
                     curr->last_activity = GetTickCount();
+                    // Any well-formed reply proves the relay port still forwards,
+                    // even when it maps to no tracked flow. This is the only
+                    // evidence the liveness check ever gets.
+                    curr->last_rx = curr->last_activity;
+                    curr->tx_since_rx = 0;
+                    curr->rx_seen = TRUE;
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[8]);
                     UINT8 app_addr[16] = {0};
                     UINT16 app_port = 0;
@@ -1482,6 +1537,9 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 // SOCKS5 UDP header for IPv6: 4 (RSV/FRAG/ATYP) + 16 (addr) + 2 (port) = 22
                 else if (recv_len > 22 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
                     curr->last_activity = GetTickCount();
+                    curr->last_rx = curr->last_activity;
+                    curr->tx_since_rx = 0;
+                    curr->rx_seen = TRUE;
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[20]);
                     UINT8 app_addr[16] = {0};
                     UINT16 app_port = 0;

@@ -33,6 +33,13 @@ BOOL udp_reply_source(int family,
                       BOOL have_remote, const UINT8 *remote_addr, UINT16 remote_port,
                       UINT8 *out_src_addr, UINT16 *out_src_port);
 
+// [Pure, host-testable] TRUE when an association has sent enough datagrams and
+// heard nothing back for long enough that its relay port must be presumed dead.
+// The caller drops the association, so the next datagram re-dials the proxy -
+// this is what keeps a silently-expired SOCKS5 UDP mapping from black-holing
+// every proxied flow for hours. See UDP_ASSOC_RX_SILENCE_MS in NR_Common.h.
+BOOL udp_assoc_is_silent(const UDP_ASSOCIATION *assoc, DWORD now);
+
 // Transfer-socket registry: Stop() shuts every registered pair down so
 // connection/transfer threads blocked in recv() unblock and exit. Threads
 // keep ownership of closesocket() (no double-close).
