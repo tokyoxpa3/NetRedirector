@@ -1,182 +1,139 @@
-# NetRedirector v2.0.0
+# NetRedirector v2.1.0
 
-## hub 正式支援 SOCKS5 UDP，以及一次「看起來能用、其實沒走 VPN」的修正
+## 補上 dual-stack 環境的最後一條漏洞：IPv6 不再從實體網卡洩漏
 
-這一版只動一個檔案：`proxy_core.py`（內建 hub 的 SOCKS5 伺服器）。但它補上的是
-協定層缺掉的半邊 —— **過去 hub 只會處理 TCP CONNECT，任何 UDP 請求一律回
-0x07（不支援的指令）**。症狀是「把全域流量導向 hub 端口時，DNS、STUN 全部
-timeout」，非常容易誤判成「VPN 或網路封了 UDP」。
+上一版讓 hub 正式支援 SOCKS5 UDP；這一版處理的是一個更早期、也更安靜的問題：
+**在雙棧網路裡，IPv6 流量從來就沒有走過 VPN。**
 
-> ⚠️ **先講最重要的一句：這不是 VPNGate 語音問題的修復。**
-> 11-11 的實機對照已確認，**VPNGate 伺服器不轉發隧道內發往外網的 UDP**。
-> 本版讓 hub 能正確處理 UDP，但上游不放行時，Discord RTC 仍然不通。
-> 詳見底下「已知限制」一節 —— 那是上游政策，客戶端做什麼都救不了。
+症狀很隱晦 —— IPv4 的出口 IP 檢查完全正確，但支援 IPv6 的網站、DNS 查詢、
+WebRTC 仍可能看到本機 ISP 派的真實位址。原因是 VPN Gate / SoftEther 公開節點
+只提供 IPv4，系統的 IPv6 預設路由依舊指向實體網卡，任何 IPv6 連線都直接從
+本機出去。
+
+> ⚠️ **先講最重要的一句：這不是「讓 IPv6 變成日本 IP」。**
+> VPN Gate 伺服器端沒有 dual-stack RA，根本不存在一個可以讓流量「來自」的
+> 日本 IPv6 位址。本版做的是**「零 IPv6 洩漏」**：把本機 IPv6 關掉，瀏覽器的
+> Happy Eyeballs 會自動退回 IPv4，於是所有流量都走 VPN。想要真正來自日本的
+> IPv6，只能換有 IPv6 的日本出口（dual-stack WireGuard / 日本 SOCKS5），
+> 用戶端做什麼都變不出來。
 
 ---
 
-## 一、hub 補上 SOCKS5 UDP ASSOCIATE（CMD 0x03）
+## 一、為什麼調路由、加規則、改 metric 都沒用
 
-### 症狀
+SoftEther 的 [issue #1163](https://github.com/SoftEtherVPN/SoftEtherVPN/issues/1163)
+講的是同一件事：Windows client 的 `Win32AddRouteEntry()` 只安裝 IPv4 預設路由，
+IPv6 沒有對應的路由管理。維護者在 2021 年說明這是刻意設計（hub option
+`NoIPv6DefaultRouterInRAWhenIPv6`），後來的 PR #1443 / #1507 才補上 IPv6 route
+management 並把預設改回允許遠端 IPv6 router —— **但那需要伺服端真的發 RA**，
+公開 VPN Gate 節點沒有。
 
-把全局流量導向本機 hub 端口（30678，出口綁 VPNGate 虛擬網卡）時，**所有 UDP
-（DNS、STUN）全部 timeout**。TCP 正常，所以直覺會往「VPN 封 UDP」或「SoftEther
-的 UDP Acceleration 沒開」去查。
+實機量測（19 張網卡）：
 
-### 根因：不是網路，是 hub 不認識這個指令
-
-NR 核心早就支援 UDP：`NR_Common.h` 的 relay 監聽 33200，`NR_Core.c` 的
-`establish_udp_associate_with_config()` 會對代理發出 0x03。但 hub 端只定義了
-`CMD_CONNECT = 0x01`，`cmd != 0x01` 就直接回 0x07 ⇒ UDP 全滅。
-
-VPNGate 本身沒問題：`ping -S 10.211.1.67 8.8.8.8` 走隧道 45ms 正常；
-SoftEther 虛擬網卡是 L3，隧道內本來就能承載 UDP（UDP over TCP），
-UDP Acceleration 停用不影響。
-
-### 修正
-
-新增 0x03 分支：`handle_udp_associate()` 挑出口介面 → 建立 UDP socket →
-回覆 BND.ADDR / BND.PORT → 在 TCP 控制連線存活期間雙向搬運 datagram。
-`cmd` 不是 0x01 / 0x03 時仍然回 0x07，**既有行為完全不變**。
-
-同時補齊 RFC 1928 §7 的標頭處理：
-
-| ATYP | 處理 |
+| 項目 | 結果 |
 | :--- | :--- |
-| `0x01` IPv4 | 直接解出位址 |
-| `0x03` 域名 | `idna` 解碼後解析成 IPv4（出口 socket 是 `AF_INET`） |
-| `0x04` IPv6 | 另開 `AF_INET6` socket 原生送出 |
-| `FRAG != 0` | 不支援分片，直接丟棄 |
+| `::/0` 路由 | **只有一條**，在 `乙太網路` (ifIndex 4) → `fe80::524f:...` |
+| 實體網卡 IPv6 | `2001:b011:800b:3acc::/64` 全球位址 |
+| 16 張 SoftEther VPN 網卡 | 全部只有 link-local `fe80::`，**沒有任何全球 IPv6** |
+| IPv6 DNS | `fe80::524f:...`（on-link） |
+| IPv6 interface metric | 實體 25、VPN 各 35（系統自動值） |
 
-回程標頭也必須同時支援 IPv4 與 IPv6：引擎端對 IPv6 用的是 **22 bytes**
-（4 + 16 + 2），若這裡只會組 IPv4，IPv6 的回程會被引擎丟掉。
+專案自己也有第二個洩漏點：`proxy_core.py` 對 IPv6 目標的 TCP 連線與
+`ensure_v6_socket()` 都是 `bind(("::", 0))`，註解已寫明「VPNGate 節點是純
+IPv4，沒有 IPv6 出口可綁」。所以即使引擎的 `* → PROXY` 規則把 IPv6 封包攔下來
+送進 hub，hub 連線時仍查系統路由表，照樣從實體網卡出去。
 
----
-
-## 二、出口 socket 必須綁到 VPN 網卡 IP（最危險的靜默錯誤）
-
-這是整包改動裡最關鍵的一點，也是最不容易被發現的。
-
-機器上有 16 張 VPN 虛擬網卡（metric 10）與一張實體網卡（metric 1），
-**預設路由走實體網卡**。hub 的 TCP 之所以能走 VPN，是靠既有的
-`remote.bind((bind_ip, 0))` 明確指定來源。
-
-UDP 若照抄「建 socket 就送」，`sendto()` 會依路由表挑來源位址 ⇒ 封包從
-**真實 IP** 出去。結果是「hub 看起來能用 UDP」但實際上完全沒走 VPN ——
-比直接失敗更糟，因為沒有任何錯誤訊息，也不會有人去查來源位址。
-
-實測依據：`ping -S 10.211.1.67 8.8.8.8` 45ms（隧道內），
-`ping -S 192.168.1.200 8.8.8.8` 6ms（實體網卡），兩條路徑確實不同。
-現在 UDP 出口 socket 一律 `bind((bind_ip, 0))`，與 TCP 對齊。
+順帶釐清一個常被聯想的開關：**「自動管理介面計量」與此無關**。那個功能只下
+`Set-NetIPInterface -AddressFamily IPv4`，目的是讓實體網卡當 IPv4 主路由；
+它完全沒碰 IPv6 metric，關掉或反轉都不會改變 IPv6 的路徑。
 
 ---
 
-## 三、客戶端／出口 socket 分離，不再用「第一個來源」猜人
+## 二、做法：停用實體網卡的 TCP/IPv6 綁定
 
-舊設計用單一 socket 同時收兩邊，再用「第一次收到的來源位址」判斷誰是客戶端。
-只要第一個封包判斷錯，整個 session 就會把客戶端送來的封包當成目標回應、
-原樣彈回去。而且**不能比對控制連線的 peer IP** —— 引擎的 relay socket 可能
-綁在 VPN IP 上，來源會是 `10.211.1.x`。
+入口在右上角 **⚙ →「IPv6 防洩漏設定...」**。
 
-現在分工明確：
-
-- `client_sock` 只會收到客戶端送來的 SOCKS5 UDP 封包；
-- `out_sock`（綁在 VPN 網卡上）只會收到目標回來的原始封包；
-- IPv6 目標另開 `out6_sock`，不混進 VPN 出口的存活判定。
-
-拆開之後不可能搞錯方向。控制連線關閉或閒置 120 秒時，
-`finally` 一定歸還介面配額並關閉所有 socket。
-
----
-
-## 四、UDP 出口熱切換：用「沉默」當判據
-
-VPNGate 的免費節點隨時會斷，但 UDP 沒有重傳、沒有 RST、也沒有 FIN，
-唯一觀察得到的訊號就是**送出去卻完全沒有回應**。
-
-| 參數 | 值 | 理由 |
-| :--- | :--- | :--- |
-| 觸發 | 送出 ≥ 2 個封包且沉默 ≥ 4 秒 | 兼顧語音與握手兩種節奏 |
-| 切換上限 | 4 次 | 目標本來就不回時，不要無限換卡 |
-| 切換後冷卻 | 6 秒 | 避免同一輪反覆重試 |
-| socket buffer | 1 MB | 吸收語音／遊戲的突發封包 |
-| 閒置逾時 | 120 秒 | 回收殭屍 session 的介面配額 |
-
-門檻刻意**用「時間」為主、封包數為輔**，而不是像引擎那樣等 20 個封包：
-語音是 50pps，20 個封包只花 0.4 秒；但 Discord 的握手探測是「8 秒才一顆」，
-等 20 顆要 160 秒 —— 使用者感受到的就是「retry 好幾次才連上」。
-
-換卡時 `client_sock` 與 BND.PORT 完全不變，**客戶端（引擎）不會察覺**，
-只會感覺到一次短暫停頓。若交給引擎判斷，它要等 15 秒才放棄並重撥整個
-association，主觀感受就是「連線一直斷」。
+- **只列實體網卡**：PowerShell 用 `Get-NetAdapter -Physical`，再加上關鍵字黑名單
+  （`softether` / `vpn` / `vmware` / `hyper-v` / `tap` / `tun` …）雙重保險。
+  上述 19 張網卡的機器實測只列出 `乙太網路` 一張 —— 16 張 SoftEther VPN 與
+  2 張 VMware 虛擬網卡都不會出現，也不需要停用（它們只有 `fe80::`）。
+- **自己選網卡**：表格顯示網卡名稱、描述、連線狀態、IPv6 綁定狀態
+  （`啟用 (會洩漏)` / `已停用 (已防護)`）與全球 IPv6 位址。首次開啟會自動勾選
+  目前 IPv6 仍啟用、且有全球位址的網卡；點名稱或描述欄都能切換勾選。
+- 按「啟用防護」前有確認對話框，執行
+  `Disable-NetAdapterBinding -ComponentID ms_tcpip6`。連 ICMPv6 / RA /
+  on-link IPv6 DNS 一起消失，比路由表或防火牆規則都乾淨。
+- PowerShell 全部跑在背景執行緒，完成後以 Qt Signal 回 UI，不卡介面。
 
 ---
 
-## 五、連線時間預算：最壞 80 秒 → 8 秒
+## 三、還原：這一版最花功夫的地方
 
-原本是「每張網卡 5 秒、最多 16 張」＝最壞 **80 秒**。但引擎端等不到
-SOCKS5 回應就會記一筆 `SOCKS5 handshake failed` 並丟掉連線，
-使用者感受到的是**隨機斷線**。
+`Disable-NetAdapterBinding` 寫入的是**持久化系統設定，重開機仍然有效**。
+所以「還原」不能只是無腦把所有網卡 `Enable` —— 那會把使用者原本就自己關掉的
+IPv6 打開。
 
-現在改成兩層預算：單次嘗試 3 秒、整個請求 8 秒。
-寧可早點回 `0x01` 讓引擎重試，也不要拖到對方先放棄。
+- `config.json` 新增 `ipv6_guard.original`，記錄每張網卡**被停用前**的綁定狀態；
+  「還原設定」只重新啟用原本就是啟用的網卡。
+- 防護已啟用時又按一次「啟用防護」，`merge_original()` 會保留第一次快照，
+  不會把狀態洗成「原本就是關閉」而導致還原失效。
+- 狀態持久化 → 程式崩潰或被強制結束後，下次啟動仍可還原；啟動時若防護仍為
+  啟用，會對「目前又被改回啟用」的網卡重新套用一次（驅動更新、系統還原都可能
+  讓 IPv6 悄悄回來）。
+- 可勾「結束程式時自動還原」，在關閉流程**同步**執行 —— 程式即將結束，背景
+  執行緒會被砍掉，不能非同步處理。還原失敗時保留 `original` 供下次重試。
+- 網卡名稱可能是中文、甚至含引號，因此整段腳本走 `-EncodedCommand`
+  (UTF-16LE base64)，參數再以 UTF-8 base64 的 JSON 內嵌並由 PowerShell 端
+  `ConvertFrom-Json` 解開，全程不把使用者資料拼進程式碼。
+
+設定檔形狀（舊設定檔沒有此欄位時，會視為「防護關閉」，不影響既有組態）：
+
+```json
+"ipv6_guard": {
+  "enabled": false,
+  "adapters": [],
+  "original": {},
+  "restore_on_exit": false
+}
+```
 
 ---
 
-## 六、UDP 改挑延遲最低的介面，TCP 維持原策略
+## ⚠️ 注意事項與已知限制
 
-TCP 仍用「活躍連線數最少」的負載平衡，避免單一網卡被吃滿。
-UDP 沒有重傳，RTT 抖動會直接變成語音斷續，所以新增 `prefer_latency`，
-改以**延遲最低**優先、連線數次之。這只影響 UDP，不改 TCP 的行為。
-
----
-
-## ⚠️ 已知限制：VPNGate 出口的外網 UDP 仍然不通
-
-重新建置後，hub 的 UDP ASSOCIATE 確實生效：`Get-NetUDPEndpoint` 看到
-`IntegratedApp` 建立了 `10.211.1.10:62876`（綁在 VPN 網卡上）。
-**但 Discord RTC / STUN 仍然是 0/4。**
-
-同一時間、同一台機器的四組對照：
-
-| 測試 | 結果 |
-| :--- | :--- |
-| `ping -S 10.211.1.10 8.8.8.8`（ICMP 經 VPN） | **OK 112ms** |
-| `Resolve-DnsName -Server 10.211.254.254`（UDP 53 到 VPN 內部 DNS） | **OK** |
-| Python 綁 VPN IP → UDP 53 / 3478 到外網 | **timeout** |
-| 同上再加 `IP_UNICAST_IF` 強制介面 | **timeout** |
-| 手機 Pro 出口的 STUN 19302 / 3478 | **OK** |
-
-隧道本身沒問題（ICMP 通、VPN 內部 UDP 通），**只有「隧道內發往外網的 UDP」
-被丟棄** ⇒ 是 VPNGate 伺服器的政策，不是 NR、也不是 hub 的實作。
-
-所以：
-
-- hub 的 UDP 支援對**支援 UDP 的上游**仍然有效（手機 Pro 出口已驗證 0x03 可用）；
-- 若要用 VPNGate 跑 RTC，只能換節點試（多數應該一樣），或改用支援 UDP 的
-  VPN 協定（WireGuard / OpenVPN-UDP）。
+- **影響整台電腦**：啟用後所有 IPv6 連線（含區網 IPv6、IPv6 DNS、VMware 虛擬
+  網路的 v6）都會中斷，直到按「還原設定」。這是刻意取捨，不是 bug。
+- 需要系統管理員權限（本程式載入 WinDivert 時原本就要求）。
+- 這是「零 IPv6 洩漏」，不是「日本 IPv6」。對會同時檢查其他地區訊號的服務，
+  IP 只是其中一環（時區、語言、帳號／門號地區等仍需一併留意）。
+- 其餘 14 個語系（日／韓／德／法…）的新字串先以英文補齊，以通過
+  「所有語系 key 集合一致」的檢查；後續版本再補完整翻譯。
+- 驗證方式：`curl -4 https://api.ipify.org` 應為 VPN 出口 IP、
+  `curl -6 https://api64.ipify.org` 應直接失敗，再用 `ipleak.net` 檢查
+  DNS 與 WebRTC。
 
 ---
 
 ## 測試
 
-- **`pytest` 246 passed**（與 v1.9.1 基準一致）。
-- **`flake8` 淨變化 0**：以違規行內容做多重集合差集、不比行號；
-  這次新改動引入的 20 項全數修掉，並順帶消除 3 個既有違規。
-- CI 的 `F821` 未定義名稱檢查乾淨、模組匯入 smoke test 通過。
-- **loopback 端到端**（11-11）：ASSOCIATE 回覆 `rep=0x00`、BND 位址正確、
-  雙向 echo 正確、控制連線關閉後 session 釋放；TCP 迴歸的 CONNECT 正常，
-  BIND（0x02）仍回 0x07。
-- **C 核心這次未改動**（`NetRedirector/` 一行未改），C 測試由 CI 執行。
+- **`pytest` 278 passed**（v2.0.0 基準 246，新增 32 個：PowerShell 腳本組成、
+  輸出解析、狀態／還原邏輯、Qt offscreen 對話框流程、設定序列化）。
+- CI 等價檢查全綠：`ast.parse`、模組匯入 smoke test、
+  `flake8 --select=F821` 未定義名稱檢查乾淨。
+- **實機只讀驗證**：`list_adapters()` 正確回傳唯一一張實體網卡、
+  `ipv6_enabled=True`、全球 IPv6 位址；Qt offscreen 冒煙測試確認
+  「開對話框 → 背景讀取 → Signal 回填表格」整條非同步鏈路。
+- 測試全部以 mock / 注入的 provider 取代 PowerShell，**不會更動系統設定**；
+  開發期間也沒有真的停用任何網卡的 IPv6。
+- **C 核心這次一行未改**，C 測試由 CI 執行。
 
 ## 升級方式
 
-使用內建自動更新即可。版本號從 1.9.1 跳到 **2.0.0**，更新檢查用數值
-tuple 比較版本（不是字串比對），不會誤判新舊。
+使用內建自動更新即可，版本號從 2.0.0 → **2.1.0**。若更新流程本身有問題，
+直接下載本頁 zip 手動覆蓋（`NetRedirector.dll` 必須與執行檔同目錄）。
 
-若更新流程本身有問題，直接下載本頁 zip 手動覆蓋
-（`NetRedirector.dll` 必須與執行檔同目錄）。
-
-> 提醒：設定檔 `config.json` 放在程式目錄。**手動換版本時請不要把整個資料夾
-> 直接刪掉重解壓**，否則設定會跟著消失；內建自動更新會自動保留它。
+> 提醒：設定檔 `config.json` 放在程式目錄，IPv6 防護狀態也存在這裡。
+> **手動換版本時請不要把整個資料夾刪掉重解壓**，否則設定（以及還原所需的
+> `ipv6_guard.original`）會跟著消失；內建自動更新會自動保留它。
 > 另外，若你跑的是打包版，只替換 `.py` 原始檔**不會生效**，請用釋出的 zip
 > 覆蓋（或自行重新建置）。

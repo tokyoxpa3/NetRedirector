@@ -8,11 +8,12 @@ import json
 import os
 
 import secure_config
+import ipv6_guard
 
 
 def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies, rules,
                       check_updates=True, autostart=True, manage_metric=True,
-                      auto_direct=None, auto_direct_enabled=True):
+                      auto_direct=None, auto_direct_enabled=True, ipv6_guard_state=None):
     """把執行期狀態序列化為 config.json 結構。
 
     - Proxy: 移除動態數據 (latency/ID)，密碼以 DPAPI 加密
@@ -27,6 +28,9 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
       None 代表「呼叫端未提供」，交由還原端帶入預設值；明確的 [] 則代表
       使用者已把清單清空，須原樣保存。
     - auto_direct_enabled: 是否啟用上述自動直連偵測 (齒輪選單的開關)。
+    - ipv6_guard_state: IPv6 防洩漏狀態 (enabled / adapters / original /
+      restore_on_exit)。``original`` 記錄每張網卡被停用前的 IPv6 綁定狀態，
+      是精準還原的依據，絕對不能省略；舊設定檔無此欄位時寫入安全預設值。
     """
     config_data = {
         "lang": lang,
@@ -37,6 +41,7 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
         "manage_metric": bool(manage_metric),
         "auto_direct": list(auto_direct) if auto_direct else [],
         "auto_direct_enabled": bool(auto_direct_enabled),
+        "ipv6_guard": ipv6_guard.normalize_state(ipv6_guard_state),
         "hubs": hubs or {},
         "proxies": [],
         "rules": [],

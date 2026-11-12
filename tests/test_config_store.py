@@ -265,3 +265,50 @@ def test_auto_direct_enabled_default_and_roundtrip(tmp_path):
     path = os.path.join(tmp_path, "config.json")
     assert config_store.save_config_file(path, data_off) is None
     assert config_store.load_config_file(path)["auto_direct_enabled"] is False
+
+
+# ----------------------------------------------------------- IPv6 防洩漏狀態
+
+def test_ipv6_guard_default_is_off():
+    """舊設定檔 (未提供 ipv6_guard) 序列化後必須是安全的「防護關閉」。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
+    assert data["ipv6_guard"] == {
+        "enabled": False, "adapters": [], "original": {},
+        "restore_on_exit": False,
+    }
+
+
+def test_ipv6_guard_persists_original_snapshot(tmp_path):
+    """original 是精準還原的唯一依據，必須完整往返 (含中文網卡名)。"""
+    proxies, rules = sample_state()
+    state = {
+        "enabled": True,
+        "adapters": ["乙太網路", "Wi-Fi"],
+        "original": {"乙太網路": True, "Wi-Fi": False},
+        "restore_on_exit": True,
+    }
+    data = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules, ipv6_guard_state=state)
+    assert data["ipv6_guard"] == state
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data) is None
+    loaded = config_store.load_config_file(path)
+    assert loaded["ipv6_guard"]["original"] == {
+        "乙太網路": True, "Wi-Fi": False}
+    assert loaded["ipv6_guard"]["enabled"] is True
+    assert loaded["ipv6_guard"]["restore_on_exit"] is True
+
+
+def test_ipv6_guard_garbage_state_is_sanitized():
+    proxies, rules = sample_state()
+    data = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules,
+        ipv6_guard_state={"enabled": "yes", "adapters": "oops", "original": 3})
+    guard = data["ipv6_guard"]
+    assert guard["enabled"] is True
+    assert guard["adapters"] == []
+    assert guard["original"] == {}
+    # 寫入的必須是純 JSON 可序列化內容
+    json.dumps(guard, ensure_ascii=False)

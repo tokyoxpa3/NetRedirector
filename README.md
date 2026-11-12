@@ -62,11 +62,19 @@
 - **SOCKS5 IPv6 轉發**：支援 SOCKS5 ATYP_IPV6 及 HTTP CONNECT `[IPv6]:port` 格式。
 - **萬用字元比對**：IPv6 規則比對支援完整位址、`*` 萬用匹配，以及 **CIDR 網段**（`2001:db8::/32`、`::/0`）。沒有 CIDR 時 IPv6 規則只能寫單一位址（一個 /64 是 2^64 個位址），網段規則實際上無法表達。
 
-### 6. 高效網路診斷與流量監控
+### 6. IPv6 防洩漏（實體網卡 TCP/IPv6 開關）
+- **為什麼需要**：VPN Gate / SoftEther 公開節點只提供 IPv4，伺服器端沒有 dual-stack RA，本機不存在「日本端的 IPv6」。即使 WinDivert 攔下 IPv6 封包並轉給 Hub，Hub 仍會查系統路由表，唯一的 `::/0` 指向實體網卡的 ISP router，封包就從真實所在地出去。正確目標因此是「零 IPv6 洩漏」：讓本機 IPv6 不通，瀏覽器的 Happy Eyeballs 會自動退回 IPv4 走 VPN。
+- **入口**：右上角 ⚙ →「IPv6 防洩漏設定...」。對話框只列出**實體網卡**（`Get-NetAdapter -Physical` + 關鍵字黑名單），SoftEther / VPN / VMware / Hyper-V 等虛擬網卡不會出現，也不需要停用。
+- **自己選網卡**：勾選要處理的網卡（首次開啟會自動勾選目前 IPv6 仍啟用、且有全球 IPv6 位址的網卡）。表格顯示連線狀態、IPv6 綁定狀態與全球 IPv6 位址；按「啟用防護」會對勾選網卡執行 `Disable-NetAdapterBinding -ComponentID ms_tcpip6`，操作前有確認對話框。
+- **可還原**：程式把每張網卡「被停用前」的綁定狀態存進 `config.json` 的 `ipv6_guard.original`，按「還原設定」只重新啟用原本就是啟用的網卡，不會把使用者自己關掉的 IPv6 誤開。也可勾「結束程式時自動還原」，在結束流程同步還原。
+- **持久化／權限**：`Disable-NetAdapterBinding` 寫入系統設定，重開機仍然有效；啟動時若 `ipv6_guard.enabled` 為 true 會重新套用一次（驅動更新或系統還原可能把 IPv6 改回來）。需系統管理員權限（本程式原本就要求）。
+- **影響範圍**：整台電腦的 IPv6 連線（含區網 IPv6、on-link IPv6 DNS、ICMPv6/RA）都會中斷，直到還原為止。驗證：`curl -4 https://api.ipify.org` 應為 VPN 出口 IP、`curl -6 https://api64.ipify.org` 應失敗，再用 `ipleak.net` 檢查 WebRTC / DNS。
+
+### 7. 高效網路診斷與流量監控
 - 內建優化的 `network_utils` 模組，取代傳統緩慢的 cmd `ping` / `ipconfig` 命令，提供毫秒級網路介面檢測與即時延遲監控。
 - 支援右鍵點擊即時流量記錄，一鍵快速新增進程攔截規則。
 
-### 7. VPN Gate 節點自動派發 (VPN Gate 分頁)
+### 8. VPN Gate 節點自動派發 (VPN Gate 分頁)
 - 抓取 [VPN Gate](https://www.vpngate.net/) 即時公開中繼節點清單，依速度/評分排序。
 - 支援篩選：排除 `public-*` 節點、排除 port 443、最低速度門檻、指定國家。
 - 對 SoftEther 虛擬網卡（`vpncmd.exe`）自動設定（含 TCP 連線數與斷線重連等進階選項）、連線並驗證 tunnel 通網；勾選「自動連線」後會持續補上離線網卡，單一節點失敗自動換下一個候選。

@@ -32,6 +32,8 @@ import process_utils  # [本機控制 API] 列舉執行中進程，供 auto_dire
 import control_api  # [本機控制 API] 讓自家工具查詢/請求直連規則
 from autosave import SaveScheduler  # [自動存檔] 變更即存 + 關機前強制落地
 import interface_metrics  # [介面計量] SoftEther 虛擬網卡 vs 實體網卡計量校正
+import ipv6_guard  # [IPv6 防洩漏] 停用實體網卡 TCP/IPv6 並可精準還原
+from ipv6_guard_ui import IPv6GuardDialog  # [IPv6 防洩漏] 網卡選擇對話框
 from app_helpers import (  # [模組化] GUI 輔助元件 (自本檔抽出)
     check_proxy_connection, SignalLogHandler, NetworkMonitorWorker, RedirectorSignals,
 )
@@ -110,6 +112,7 @@ class StageWorker(QThread):
 class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, MonitorTabMixin, VpnGateTabMixin):
     update_proxy_table_signal = Signal() 
     metric_sync_done = Signal(object)  # 背景校正介面計量的結果 (dict)
+    ipv6_reapply_done = Signal(object)  # 啟動時重新套用 IPv6 防護的結果 (dict)
     CONFIG_FILE = "config.json"  # [新增] 設定檔路徑
 
     def __init__(self):
@@ -170,6 +173,10 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.auto_direct = list(control_api.DEFAULT_AUTO_DIRECT)
         # 齒輪選單的「自動偵測並加入直連程式」開關；關閉則啟動掃描不執行
         self.auto_direct_enabled = True
+        # [IPv6 防洩漏] 實體網卡 TCP/IPv6 綁定的開關與原始狀態紀錄。
+        # 由 load_config 還原；Disable-NetAdapterBinding 是持久化系統設定，
+        # 必須記住「原本是啟用」的網卡才能精準還原。
+        self.ipv6_guard_state = ipv6_guard.default_state()
         self.control_api = None    # 本機控制 API server (於 __init__ 尾端啟動)
         self.current_interfaces = {}
         self.selected_hub_port = None
@@ -222,6 +229,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         self.update_proxy_table_signal.connect(self.refresh_custom_proxy_table)
         self.metric_sync_done.connect(self._on_metric_sync_done)
+        self.ipv6_reapply_done.connect(self._on_ipv6_reapply_done)
 
         # [本機控制 API] 跨執行緒把請求排回 UI 執行緒 (規則讀寫必須在此)。
         # 連線必須在 API server 啟動前建立，否則第一筆請求可能落空。
@@ -612,7 +620,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.chk_autostart.isChecked() if hasattr(self, 'chk_autostart') else True,
             (self.chk_manage_metric.isChecked()
              if hasattr(self, 'chk_manage_metric') else True),
-            self.auto_direct, self.auto_direct_enabled)
+            self.auto_direct, self.auto_direct_enabled,
+            self.ipv6_guard_state)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
             if not quiet:
@@ -697,6 +706,11 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             if hasattr(self, 'chk_manage_metric'):
                 self.chk_manage_metric.setChecked(bool(data.get("manage_metric", True)))
             self._sync_interface_metrics()
+
+            # [IPv6 防洩漏] 還原狀態並在背景重新套用。舊設定檔沒有
+            # ipv6_guard 欄位時 normalize_state 會給「防護關閉」的安全預設。
+            self.ipv6_guard_state = ipv6_guard.normalize_state(data.get("ipv6_guard"))
+            self._reapply_ipv6_guard()
 
             self.append_log("正在還原設定...")
 
@@ -882,6 +896,69 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                     result["physical"], result.get("physical_metric")))
         if parts:
             self.append_log("介面計量校正: " + "；".join(parts))
+
+    # --------------------------------------------------------- IPv6 防洩漏
+    def _open_ipv6_guard_dialog(self):
+        """⚙ → IPv6 防洩漏設定：使用者自己勾選實體網卡 (VPN 虛擬網卡不列出)。"""
+        dlg = IPv6GuardDialog(
+            self,
+            state=self.ipv6_guard_state,
+            on_state_changed=self._on_ipv6_guard_state_changed,
+            log=self.append_log,
+        )
+        dlg.exec()
+
+    def _on_ipv6_guard_state_changed(self, state):
+        self.ipv6_guard_state = ipv6_guard.normalize_state(state)
+        self._request_save()
+
+    def _reapply_ipv6_guard(self):
+        """上次結束時防護仍啟用 → 重新開機後再套用一次。
+
+        網卡驅動更新、系統還原或使用者手動改回綁定都可能讓 IPv6 悄悄回來；
+        只對「目前仍是啟用」的已記錄網卡下 Disable，不動原本就關閉的網卡，
+        也不覆寫 ``original`` (那是還原的唯一依據)。
+        """
+        state = self.ipv6_guard_state
+        if not state["enabled"] or not state["adapters"]:
+            return
+
+        def work():
+            result = {"ok": False, "changed": [], "skipped": False, "error": None}
+            try:
+                listed = ipv6_guard.list_adapters()
+                if not listed.get("ok"):
+                    result["error"] = listed.get("error")
+                else:
+                    by_name = {a["name"]: a for a in listed["adapters"]}
+                    targets = [
+                        n for n in state["adapters"]
+                        if n in by_name and by_name[n]["ipv6_enabled"]
+                    ]
+                    if not targets:
+                        result["ok"] = True
+                        result["skipped"] = True
+                    else:
+                        result.update(ipv6_guard.set_binding(targets, False))
+            except Exception as e:  # noqa: BLE001 — 背景執行緒不得讓例外逸出
+                result["error"] = str(e)
+            self.ipv6_reapply_done.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ipv6_reapply_done(self, result):
+        result = result or {}
+        if not result.get("ok"):
+            if result.get("error"):
+                self.append_log("IPv6 防洩漏重新套用失敗: {}".format(result["error"]))
+            return
+        changed = result.get("changed") or []
+        if changed:
+            self.append_log(
+                "IPv6 防洩漏: 已重新停用 {} 的 TCP/IPv6".format("、".join(changed)))
+        else:
+            self.append_log("IPv6 防洩漏: 防護中，網卡設定未變動")
+        self.append_log("要還原 IPv6 請至 ⚙ →「IPv6 防洩漏設定」按「還原設定」")
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -1099,6 +1176,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         auto_action.setDefaultWidget(auto_row)
         self.menu_overflow.addAction(auto_action)
 
+        # [IPv6 防洩漏] 開啟實體網卡選擇對話框 (VPN 虛擬網卡不會列出)
+        self.act_ipv6_guard = self.menu_overflow.addAction(
+            self.t("IPv6 防洩漏設定..."))
+        self.act_ipv6_guard.triggered.connect(self._open_ipv6_guard_dialog)
+        self._reg("text", self.act_ipv6_guard, "IPv6 防洩漏設定...")
+
         self.menu_overflow.addSeparator()
 
         self.act_check_update = self.menu_overflow.addAction(self.t("檢查更新"))
@@ -1293,9 +1376,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         # [診斷] 逐段計時寫入 shutdown_timing.log，定位關閉慢的步驟
         marks = []
-        t0 = time.perf_counter()
+
+        # [IPv6 防洩漏] 必須同步執行：程式即將結束，背景執行緒會被直接砍掉。
+        # 還原成功時更新 state，接下來的 save_config 才會把「已還原」寫入設定檔。
+        t4 = time.perf_counter()
+        self._restore_ipv6_on_exit_if_needed()
+        marks.append(("ipv6_guard_restore", time.perf_counter() - t4))
 
         # 已有待寫變更時不需再等自動存檔計時器，由這次的 save_config 落地
+        t0 = time.perf_counter()
         if self._save_scheduler is not None:
             self._save_scheduler.cancel()
         self.save_config()
@@ -1323,6 +1412,38 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                     f.write(f"{name}: {dt*1000:.0f} ms\n")
         except OSError:
             pass
+
+    def _restore_ipv6_on_exit_if_needed(self):
+        """結束程式時自動還原 IPv6 (僅在使用者勾選時)；其餘情況留下提醒。
+
+        還原失敗時不清 state，讓下次啟動仍保有 ``original`` 可手動還原。
+        """
+        state = ipv6_guard.normalize_state(getattr(self, 'ipv6_guard_state', None))
+        if not state["enabled"]:
+            return
+        if not state["restore_on_exit"]:
+            self.append_log(
+                "IPv6 防洩漏: 防護仍啟用，下次啟動會繼續生效 "
+                "(⚙ → IPv6 防洩漏設定 可還原)")
+            return
+
+        try:
+            new_state, res = ipv6_guard.restore_state(state)
+        except Exception as e:  # noqa: BLE001 — 關機流程不得因還原失敗而中斷
+            self.append_log(
+                "IPv6 防洩漏: 自動還原失敗 ({})，請於下次啟動後手動還原".format(e))
+            return
+        if res.get("noop"):
+            return
+        if not new_state["enabled"]:
+            applied = [r for r in res.get("results", []) if r.get("state") == "ok"]
+            self.ipv6_guard_state = new_state
+            self.append_log(
+                "IPv6 防洩漏: 結束前已自動還原 {} 張網卡".format(len(applied)))
+        else:
+            self.append_log(
+                "IPv6 防洩漏: 自動還原失敗 ({})，請於下次啟動後手動還原".format(
+                    res.get("error") or "無網卡變更"))
 
     # [新增] 關閉視窗：視「縮到系統匣」設定決定直接離開、直接縮匣或詢問
     def closeEvent(self, event):

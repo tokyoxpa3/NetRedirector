@@ -1,6 +1,12 @@
 {
   "lang": "zh_TW",
   "ping_target": "8.8.8.8",
+  "ipv6_guard": {
+    "enabled": false,
+    "adapters": [],
+    "original": {},
+    "restore_on_exit": false
+  },
   "hubs": {},
   "proxies": [],
   "rules": []
